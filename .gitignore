@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+*.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data outputs (generated)
+data/out/
+data/memory.db
+data/*.db
+data/checkpoints.db
+
+# LangGraph runtime
+.langgraph_api/
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp/scratch files
+_*.txt
+_*.py
+_*.log

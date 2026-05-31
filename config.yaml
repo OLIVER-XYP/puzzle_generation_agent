@@ -1,0 +1,41 @@
+# Puzzle generation agent — LLM-based generation + script verification
+run:
+  source_eval: puzzle.jsonl
+  out_dir: data/out
+  count_per_rule: 20
+  rules: ["1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25"]
+  seed: 20260601
+  max_retries_per_item: 15
+  recursion_limit: 20000
+
+generator:
+  enabled: true
+  provider: deepseek
+  model: deepseek-chat
+  base_url: https://api.deepseek.com
+  api_key: "sk-16d0ee12d10543229b9f2c3a77a1f732"
+  temperature: 0.7
+  max_generation_attempts: 5     # self-correction retries
+  max_output_tokens: 4096
+  use_reasoner: false            # set true for CoT-heavy rules
+
+teacher:
+  enabled: false
+
+# Budget & rate limiting
+budget:
+  max_tokens_per_puzzle: 8000
+  rate_limit_rpm: 30             # requests per minute
+
+# Memory: STM (dict|redis), LTM (sqlite|postgres)
+memory:
+  stm: dict                    # "redis" for production
+  ltm: sqlite                  # "postgres" for production
+  redis_url: ""                # $REDIS_URL
+  database_url: ""             # $DATABASE_URL
+  db_path: data/memory.db
+
+dedup:
+  use_symmetry: true
+
+wordlist: data/wordlist.txt
