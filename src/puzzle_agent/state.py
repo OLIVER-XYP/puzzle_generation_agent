@@ -38,9 +38,11 @@ class GraphState(TypedDict, total=False):
 
     # natural language processing
     _nl_result: Any                     # RewriteResult from query rewriter (internal)
+    nl_response: str                    # rendered answer for non-generation NL commands (list/inspect/help)
 
     # outputs / logs
     accepted_records: List[Dict[str, Any]]
     rejected_log: List[Dict[str, Any]]
     stats: Dict[str, Any]
     output_path: str                    # set by save_output node
+    summary: Dict[str, Any]             # RunSummary.to_dict() from the summarize node

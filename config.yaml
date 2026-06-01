@@ -18,6 +18,7 @@ generator:
   max_generation_attempts: 5     # self-correction retries
   max_output_tokens: 4096
   use_reasoner: false            # set true for CoT-heavy rules
+  use_tools: true                # LLM function calling (Generator/Solver/Reviewer) — ON by default
 
 teacher:
   enabled: false

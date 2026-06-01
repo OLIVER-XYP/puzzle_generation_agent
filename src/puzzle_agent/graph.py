@@ -74,6 +74,9 @@ class Context:
 
         self.rng = Random(cfg["run"]["seed"])
 
+        # Tool integration: enable LLM function calling for generation/solving/review
+        self.use_tools = cfg.get("generator", {}).get("use_tools", True)
+
         # Memory: two-tier persistence (STM + LTM)
         mem_cfg = cfg.get("memory", {})
         self.memory = create_memory(
@@ -87,6 +90,46 @@ class Context:
 
 def build_context(cfg: Dict[str, Any]) -> Context:
     return Context(cfg)
+
+
+def _render_nl_command(ctx: "Context", inspect_intents, other_intents) -> str:
+    """Render a text answer for non-generation NL commands (list/inspect/help/stats).
+
+    Used by the rewrite_query node so the Studio frontend shows a useful reply
+    instead of silently generating puzzles.
+    """
+    lines: List[str] = []
+    actions = {i.action for i in other_intents}
+
+    if inspect_intents:
+        for intent in inspect_intents:
+            rid = intent.params.get("rule_id", "")
+            rule = ctx.rules.get(rid)
+            if rule:
+                ex_q = rule.examples[0]["question"][:200] if rule.examples else ""
+                lines.append(f"规则 {rid}：{rule.title} ({rule.tag})")
+                lines.append(f"  说明：{rule.rule_content[:300]}")
+                lines.append(f"  示例：{ex_q}")
+            else:
+                lines.append(f"规则 {rid} 不存在。可用规则：{sorted(ctx.rules.keys(), key=int)}")
+
+    if "LIST_RULES" in actions:
+        lines.append(f"共 {len(ctx.rules)} 种规则：")
+        for rid in sorted(ctx.rules.keys(), key=int):
+            r = ctx.rules[rid]
+            lines.append(f"  • 规则 {rid}: {r.title} ({r.tag})")
+
+    if "STATS" in actions:
+        try:
+            stats = ctx.memory.get_session_stats()
+            lines.append(f"统计：{stats}")
+        except Exception:
+            lines.append("暂无统计数据。")
+
+    if "HELP" in actions or not lines:
+        lines.append("我可以：列出所有规则 / 查看规则N / 给规则N生成M道题 / 出几道数学题")
+
+    return "\n".join(lines)
 
 
 def make_nodes(ctx: Context):
@@ -129,21 +172,16 @@ def make_nodes(ctx: Context):
         inspect_intents = [i for i in result.intents if i.action == "INSPECT_RULE"]
         other_intents = [i for i in result.intents if i.action not in ("GENERATE", "INSPECT_RULE")]
 
-        # Handle non-generation commands (list, stats, inspect, etc.)
+        # Handle non-generation commands (list, stats, inspect, help, etc.)
         if not gen_intents and (other_intents or inspect_intents):
-            # Non-generation request: set rules as hints, count=0 so no generation
-            req_rules = []
-            for intent in inspect_intents:
-                rid = intent.params.get("rule_id", "")
-                if rid and rid in ctx.rules:
-                    req_rules.append(rid)
-            if not req_rules:
-                req_rules = [cfg["run"]["rules"][0]]  # default: first rule
+            # Non-generation request: render an answer, set count=0 → no generation
+            nl_response = _render_nl_command(ctx, inspect_intents, other_intents)
             state.update(
                 user_query=user_query,
-                rules=req_rules,
+                rules=[],          # no generation targets
                 count=0,
                 _nl_result=result,
+                nl_response=nl_response,
             )
             return state
 
@@ -177,10 +215,18 @@ def make_nodes(ctx: Context):
             # --- session start ---
             ctx.memory.start_session()
             # Allow Studio input override: {"rules": ["1","5"], "count": 10}
-            req_rules = state.get("rules") or cfg["run"]["rules"]
-            req_count = state.get("count") or count
-            jobs = [{"rule_id": rid, "count": req_count, "target": ctx.targets.get(rid, {})}
-                    for rid in req_rules if rid in ctx.rules]
+            # NOTE: use explicit None checks — count=0 (a non-generation NL command)
+            # must NOT fall back to the config default.
+            req_rules = state.get("rules")
+            if req_rules is None:
+                req_rules = cfg["run"]["rules"]
+            req_count = state.get("count")
+            if req_count is None:
+                req_count = count
+            # count==0 or empty rules → no generation jobs (e.g. list/inspect command)
+            jobs = ([{"rule_id": rid, "count": req_count, "target": ctx.targets.get(rid, {})}
+                     for rid in req_rules if rid in ctx.rules]
+                    if req_count > 0 else [])
             state.update(jobs=jobs, job_cursor=0,
                          eval_hashes=list(ctx.eval_hashes), accepted_hashes=[],
                          accepted_records=[], rejected_log=[],
@@ -197,7 +243,19 @@ def make_nodes(ctx: Context):
         return state
 
     def route_dispatch(state: GraphState) -> str:
-        return "llm_synthesizer" if state["job_cursor"] < len(state["jobs"]) else "save_output"
+        return "llm_synthesizer" if state["job_cursor"] < len(state["jobs"]) else "summarize"
+
+    def summarize(state: GraphState) -> GraphState:
+        """Aggregate the whole run into a RunSummary before saving.
+
+        Pulls production stats (state), quality stats (tracer), tool usage
+        (pipeline), and memory session stats into state["summary"].
+        """
+        from .summary import build_run_summary
+        with_narrative = cfg.get("run", {}).get("summary_narrative", False)
+        run_summary = build_run_summary(state, ctx, with_narrative=with_narrative)
+        state["summary"] = run_summary.to_dict()
+        return state
 
     def save_output(state: GraphState) -> GraphState:
         import os
@@ -205,6 +263,14 @@ def make_nodes(ctx: Context):
         out_dir.mkdir(parents=True, exist_ok=True)
         ds_path = out_dir / "fine_dataset.jsonl"
         records = state.get("accepted_records", [])
+        state["output_path"] = str(ds_path)
+
+        # Guard: a non-generation command (list/inspect/help) produces no records.
+        # Do NOT overwrite the existing dataset with an empty file in that case.
+        if not records:
+            ctx.memory.end_session(notes="no records (non-generation command)")
+            return state
+
         with open(str(ds_path), "w", encoding="utf-8") as f:
             for rec in records:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -215,7 +281,13 @@ def make_nodes(ctx: Context):
             per_rule[rec["rule_id"]] += 1
         with open(str(rep_path), "w", encoding="utf-8") as f:
             json.dump({"total": len(records), "per_rule": per_rule}, f, ensure_ascii=False, indent=2)
-        state["output_path"] = str(ds_path)
+
+        # --- persist the run summary alongside the dataset ---
+        summary = state.get("summary")
+        if summary:
+            sum_path = out_dir / "run_summary.json"
+            with open(str(sum_path), "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
 
         # --- persistence: end session ---
         ctx.memory.update_session_count(len(records))
@@ -234,6 +306,7 @@ def make_nodes(ctx: Context):
         output = ctx.pipeline.run(
             rule.rule_content, rule.title, rid, rule.examples, rule.target,
             require_reviewer_pass=False,
+            use_tools=ctx.use_tools,
         )
         if output.question and output.answer:
             state["candidate"] = {
@@ -393,7 +466,7 @@ def make_nodes(ctx: Context):
         llm_synthesizer=llm_synthesizer, llm_crosscheck=llm_crosscheck,
         verification=verification, route_verify=route_verify,
         data_preprocessor=data_preprocessor, route_after_accept=route_after_accept,
-        save_output=save_output,
+        summarize=summarize, save_output=save_output,
     )
 
 def build_graph(ctx: Context):
@@ -405,13 +478,14 @@ def build_graph(ctx: Context):
     g.add_node("llm_crosscheck", n["llm_crosscheck"])
     g.add_node("verification", n["verification"])
     g.add_node("data_preprocessor", n["data_preprocessor"])
+    g.add_node("summarize", n["summarize"])
     g.add_node("save_output", n["save_output"])
 
     # START → rewrite_query (NL→Intent) → dispatcher → ...
     g.add_edge(START, "rewrite_query")
     g.add_edge("rewrite_query", "dispatcher")
     g.add_conditional_edges("dispatcher", n["route_dispatch"],
-                            {"llm_synthesizer": "llm_synthesizer", "save_output": "save_output"})
+                            {"llm_synthesizer": "llm_synthesizer", "summarize": "summarize"})
     g.add_edge("llm_synthesizer", "llm_crosscheck")
     g.add_edge("llm_crosscheck", "verification")
     g.add_conditional_edges("verification", n["route_verify"],
@@ -421,5 +495,7 @@ def build_graph(ctx: Context):
     g.add_conditional_edges("data_preprocessor", n["route_after_accept"],
                             {"dispatcher": "dispatcher",
                              "llm_synthesizer": "llm_synthesizer"})
+    # summarize → save_output → END
+    g.add_edge("summarize", "save_output")
     g.add_edge("save_output", END)
     return g.compile()

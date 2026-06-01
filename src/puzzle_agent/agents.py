@@ -1,11 +1,14 @@
 """Multi-Agent architecture (P0).
 
-Generator → creates puzzles with TODO-list planning
-Solver   → independently solves them (temperature=0, different prompt)
-Reviewer → compares answers, scores quality, decides PASS/FAIL
+Generator → creates puzzles with TODO-list planning + tool-assisted verification
+Solver   → independently solves them (temperature=0, different prompt) + brute-force tools
+Reviewer → compares answers, scores quality, decides PASS/FAIL + tool-assisted checks
 
 All three are "blind" to each other — Generator doesn't see Solver's output,
 Solver doesn't see Generator's reasoning. Reviewer is the impartial judge.
+
+Each agent can call deterministic tools (validators, brute-force solvers) via
+OpenAI function-calling to reduce errors and improve accuracy.
 """
 from __future__ import annotations
 import json
@@ -21,6 +24,10 @@ from .prompt_builder import (
     build_task_prompt, estimate_tokens, PromptBudget,
 )
 from .tracer import trace_call, get_tracer
+from .tools import (
+    ToolExecutor, ToolResult,
+    get_tool_schemas, get_tool_schemas_for_role, get_tool_schemas_for_rule,
+)
 
 
 @dataclass
@@ -47,7 +54,7 @@ class GenerationOutput:
 
 
 class LlmClient:
-    """Thin wrapper around DeepSeek API."""
+    """Thin wrapper around DeepSeek API with tool-calling support."""
 
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
@@ -59,6 +66,7 @@ class LlmClient:
         self.api_key = api_key
         self.enabled = bool(api_key)
         self._client = None
+        self.tool_executor = ToolExecutor()
         if self.enabled:
             from openai import OpenAI
             self._client = OpenAI(api_key=api_key, base_url=self.base_url)
@@ -81,22 +89,76 @@ class LlmClient:
         elapsed = time.time() - t0
         return (resp.choices[0].message.content or ""), elapsed
 
+    def chat_raw(self, messages: List[Dict[str, Any]], tools: List[Dict] = None,
+                 temperature: float = 0.7, max_tokens: int = 4096,
+                 model: str = None):
+        """Low-level LLM call with full messages list + optional tools.
+
+        Returns the raw OpenAI response object, or None on failure.
+        """
+        if not self.enabled:
+            return None
+        kwargs = dict(
+            model=model or self.model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        try:
+            return self._client.chat.completions.create(**kwargs)
+        except Exception:
+            return None
+
+    def chat_with_tools(self, system: str, user: str,
+                        tools: List[Dict] = None,
+                        temperature: float = 0.7, max_tokens: int = 4096,
+                        max_rounds: int = 5, model: str = None) -> ToolResult:
+        """Chat with automatic tool execution loop.
+
+        The LLM can call tools (validators, solvers) and receive results
+        before producing the final text response.
+
+        Args:
+            system: System prompt
+            user: User prompt
+            tools: OpenAI tool schemas. Default: generator-appropriate tools.
+            temperature: LLM temperature
+            max_tokens: Max output tokens per round
+            max_rounds: Max tool-call rounds
+            model: Model override
+
+        Returns:
+            ToolResult with .text (final response), .tool_calls_made, .rounds
+        """
+        if tools is None:
+            tools = get_tool_schemas_for_role("generator")
+        return self.tool_executor.chat_with_tools(
+            client=self, system=system, user=user,
+            tools=tools, temperature=temperature,
+            max_tokens=max_tokens, max_rounds=max_rounds, model=model,
+        )
+
 
 # ======================================================================
 # Generator Agent
 # ======================================================================
 
 class GeneratorAgent:
-    """Creates puzzles with planning-guided generation."""
+    """Creates puzzles with planning-guided generation + optional tool-assisted verification."""
 
     def __init__(self, client: LlmClient, max_attempts: int = 3):
         self.client = client
         self.max_attempts = max_attempts
+        self.tool_stats: Dict[str, int] = {"calls": 0, "tool_rounds": 0}
 
     def generate(
         self, rule_content: str, rule_title: str, rule_id: str,
         examples: List[Dict], target: Dict,
         prior_errors: List[str] = None,
+        use_tools: bool = False,
     ) -> AgentResult:
         selector = ExampleSelector(examples)
         avg_len = target.get("q_len_avg", 400) if target else 400
@@ -117,12 +179,25 @@ class GeneratorAgent:
 
             full_prompt = "\n\n".join([rule_block, ex_block, task_block])
 
-            # Call LLM
+            # Call LLM (with or without tools)
             t0 = time.time()
-            raw, _ = self.client.chat(
-                GENERATOR_SYSTEM, full_prompt,
-                temperature=0.7 + attempt * 0.1, max_tokens=4096,
-            )
+            if use_tools and self.client.enabled:
+                tools = get_tool_schemas_for_role("generator")
+                tool_result = self.client.chat_with_tools(
+                    GENERATOR_SYSTEM, full_prompt,
+                    tools=tools,
+                    temperature=0.7 + attempt * 0.1,
+                    max_tokens=4096,
+                    max_rounds=4,
+                )
+                raw = tool_result.text
+                self.tool_stats["calls"] += 1
+                self.tool_stats["tool_rounds"] += tool_result.total_tool_calls
+            else:
+                raw, _ = self.client.chat(
+                    GENERATOR_SYSTEM, full_prompt,
+                    temperature=0.7 + attempt * 0.1, max_tokens=4096,
+                )
             latency = int((time.time() - t0) * 1000)
 
             # Parse
@@ -223,16 +298,45 @@ class GeneratorAgent:
 # ======================================================================
 
 class SolverAgent:
-    """Independent solver — different system prompt, temperature=0."""
+    """Independent solver — different system prompt, temperature=0.
+
+    With use_tools=True, gains access to brute-force solvers (sudoku,
+    24points, cryptarithm, word search, minesweeper, etc.) and can
+    call them to verify or compute answers deterministically.
+    """
 
     def __init__(self, client: LlmClient):
         self.client = client
+        self.tool_stats: Dict[str, int] = {"calls": 0, "tool_rounds": 0}
 
-    def solve(self, rule_content: str, question: str, rule_id: str = "") -> AgentResult:
+    def solve(self, rule_content: str, question: str, rule_id: str = "",
+              use_tools: bool = False) -> AgentResult:
         prompt = build_rule_prompt(rule_content, "") + f"\n\n## Puzzle\n{question}"
         t0 = time.time()
-        raw, latency = self.client.chat(SOLVER_SYSTEM, prompt, temperature=0.0, max_tokens=2048)
-        latency_ms = int(latency * 1000)
+
+        if use_tools and self.client.enabled:
+            tools = get_tool_schemas_for_role("solver")
+            # For specific rules, add rule-specific tools
+            rule_tools = get_tool_schemas_for_rule(rule_id) if rule_id else []
+            # Merge without duplicating
+            seen_names = {t["function"]["name"] for t in tools}
+            for rt in rule_tools:
+                if rt["function"]["name"] not in seen_names:
+                    tools.append(rt)
+                    seen_names.add(rt["function"]["name"])
+
+            tool_result = self.client.chat_with_tools(
+                SOLVER_SYSTEM, prompt,
+                tools=tools,
+                temperature=0.0, max_tokens=2048, max_rounds=6,
+            )
+            raw = tool_result.text
+            self.tool_stats["calls"] += 1
+            self.tool_stats["tool_rounds"] += tool_result.total_tool_calls
+        else:
+            raw, _ = self.client.chat(SOLVER_SYSTEM, prompt, temperature=0.0, max_tokens=2048)
+
+        latency_ms = int((time.time() - t0) * 1000)
 
         # Extract [[...]] from response
         ans = ""
@@ -255,13 +359,19 @@ class SolverAgent:
 # ======================================================================
 
 class ReviewerAgent:
-    """Compares Generator and Solver answers, scores quality."""
+    """Compares Generator and Solver answers, scores quality.
+
+    With use_tools=True, can call verify_answer, evaluate_expression,
+    and validators to get deterministic verdicts on answer correctness.
+    """
 
     def __init__(self, client: LlmClient):
         self.client = client
+        self.tool_stats: Dict[str, int] = {"calls": 0, "tool_rounds": 0}
 
     def review(self, rule_content: str, question: str,
-               gen_answer: str, sol_answer: str, rule_id: str = "") -> AgentResult:
+               gen_answer: str, sol_answer: str, rule_id: str = "",
+               use_tools: bool = False) -> AgentResult:
         prompt = (
             f"## Puzzle Rule\n{rule_content}\n\n"
             f"## Puzzle Question\n{question}\n\n"
@@ -271,8 +381,21 @@ class ReviewerAgent:
             f"Does the Generator's answer satisfy all constraints? Output JSON."
         )
         t0 = time.time()
-        raw, latency = self.client.chat(REVIEWER_SYSTEM, prompt, temperature=0.0, max_tokens=1024)
-        latency_ms = int(latency * 1000)
+
+        if use_tools and self.client.enabled:
+            tools = get_tool_schemas_for_role("reviewer")
+            tool_result = self.client.chat_with_tools(
+                REVIEWER_SYSTEM, prompt,
+                tools=tools,
+                temperature=0.0, max_tokens=1024, max_rounds=3,
+            )
+            raw = tool_result.text
+            self.tool_stats["calls"] += 1
+            self.tool_stats["tool_rounds"] += tool_result.total_tool_calls
+        else:
+            raw, _ = self.client.chat(REVIEWER_SYSTEM, prompt, temperature=0.0, max_tokens=1024)
+
+        latency_ms = int((time.time() - t0) * 1000)
 
         parsed = None
         try:
@@ -294,7 +417,11 @@ class ReviewerAgent:
 # ======================================================================
 
 class MultiAgentPipeline:
-    """Orchestrate Generator → Solver → Reviewer with mutual cross-checking."""
+    """Orchestrate Generator → Solver → Reviewer with mutual cross-checking.
+
+    Set use_tools=True to give each agent access to deterministic tools
+    (brute-force solvers, validators, difficulty checkers) via function calling.
+    """
 
     def __init__(self, cfg: Dict[str, Any]):
         self.client = LlmClient(cfg)
@@ -302,15 +429,21 @@ class MultiAgentPipeline:
         self.solver = SolverAgent(self.client)
         self.reviewer = ReviewerAgent(self.client)
         self.cfg = cfg
+        self.use_tools = cfg.get("generator", {}).get("use_tools", True)
 
     def run(self, rule_content: str, rule_title: str, rule_id: str,
             examples: List[Dict], target: Dict,
-            require_reviewer_pass: bool = True) -> GenerationOutput:
+            require_reviewer_pass: bool = True,
+            use_tools: bool = None) -> GenerationOutput:
         t0_total = time.time()
 
-        # Stage 1: Generate
+        # Determine whether to use tools (pipeline-level or per-call override)
+        _use_tools = use_tools if use_tools is not None else self.use_tools
+
+        # Stage 1: Generate (optionally with tool-assisted self-verification)
         gen_result = self.generator.generate(
             rule_content, rule_title, rule_id, examples, target,
+            use_tools=_use_tools,
         )
         if not gen_result.parsed:
             return GenerationOutput(
@@ -322,12 +455,14 @@ class MultiAgentPipeline:
         question = gen_result.parsed["question"]
         gen_answer = gen_result.parsed["answer"]
 
-        # Stage 2: Independent solve
-        sol_result = self.solver.solve(rule_content, question)
+        # Stage 2: Independent solve (optionally with brute-force tools)
+        sol_result = self.solver.solve(rule_content, question, rule_id=rule_id,
+                                       use_tools=_use_tools)
         sol_answer = sol_result.parsed.get("answer", "") if sol_result.parsed else ""
 
-        # Stage 3: Review
-        rev_result = self.reviewer.review(rule_content, question, gen_answer, sol_answer)
+        # Stage 3: Review (optionally with verification tools)
+        rev_result = self.reviewer.review(rule_content, question, gen_answer, sol_answer,
+                                          rule_id=rule_id, use_tools=_use_tools)
         rev_verdict = "FAIL"
         rev_score = 0
         rev_issues = []
@@ -354,6 +489,17 @@ class MultiAgentPipeline:
             reviewer_issues=rev_issues,
             latency_total_ms=int((time.time() - t0_total) * 1000),
         )
+
+    def get_tool_stats(self) -> Dict[str, Any]:
+        """Aggregate tool usage statistics across all agents."""
+        return {
+            "generator": dict(self.generator.tool_stats),
+            "solver": dict(self.solver.tool_stats),
+            "reviewer": dict(self.reviewer.tool_stats),
+            "total_rounds": (self.generator.tool_stats.get("tool_rounds", 0) +
+                           self.solver.tool_stats.get("tool_rounds", 0) +
+                           self.reviewer.tool_stats.get("tool_rounds", 0)),
+        }
 
 
 # ======================================================================

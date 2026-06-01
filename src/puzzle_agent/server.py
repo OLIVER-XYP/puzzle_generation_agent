@@ -40,5 +40,13 @@ def get_graph():
       - rules: list[str]  (structured override, e.g. ["4","10"])
       - count: int        (puzzles per rule)
       - seed: int         (random seed)
+
+    Topology: rewrite_query → dispatcher → (synth → crosscheck → verify →
+    preprocess)* → summarize → save_output → END
+
+    Output state includes:
+      - accepted_records: generated puzzles
+      - summary: aggregated RunSummary (production/quality/tooling/memory),
+                 also persisted to data/out/run_summary.json
     """
     return _compiled

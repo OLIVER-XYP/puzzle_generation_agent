@@ -77,6 +77,12 @@ def main():
     ap.add_argument("--parallel", action="store_true",
                     help="force parallel mode (default: auto-detect when >1 rules)")
     ap.add_argument("--workers", type=int, default=4, help="max parallel workers")
+    ap.add_argument("--tools", dest="tools", action="store_true", default=None,
+                    help="enable LLM function calling (default: on)")
+    ap.add_argument("--no-tools", dest="tools", action="store_false",
+                    help="disable LLM function calling (plain text generation)")
+    ap.add_argument("--summary-narrative", action="store_true",
+                    help="add a one-paragraph LLM narrative to the run summary")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -88,6 +94,10 @@ def main():
         cfg["run"]["seed"] = args.seed
     if args.temperature is not None:
         cfg["generator"]["temperature"] = args.temperature
+    if args.tools is not None:
+        cfg["generator"]["use_tools"] = args.tools
+    if args.summary_narrative:
+        cfg.setdefault("run", {})["summary_narrative"] = True
 
     rules = cfg["run"]["rules"]
     count = cfg["run"]["count_per_rule"]
@@ -118,6 +128,7 @@ def main():
 
         records = all_records
         ctx = None
+        graph_summary = None     # built fresh below from aggregated records
     else:
         # --- Sequential mode: single graph with all rules ---
         ctx = build_context(cfg)
@@ -145,6 +156,7 @@ def main():
         final = app.invoke(graph_input,
                           config={"recursion_limit": cfg["run"]["recursion_limit"]})
         records = final.get("accepted_records", [])
+        graph_summary = final.get("summary")
 
     # --- Output ---
     out_dir = resolve(cfg, cfg["run"]["out_dir"])
@@ -196,6 +208,32 @@ def main():
                 print(f"[trace] SFT candidate: R{rid} fail_rate={d.failure_rate:.0%} "
                       f"priority={d.priority} samples_needed={d.samples_needed} "
                       f"errors=[{top}]")
+
+    # --- tool stats ---
+    if cfg.get("generator", {}).get("use_tools"):
+        # Collect tool stats from the pipeline (graph mode)
+        if ctx is not None:
+            tool_stats = ctx.pipeline.get_tool_stats()
+        else:
+            # Parallel mode: build a fresh context just to read config
+            tool_stats = {}
+        print(f"[tools] enabled (function calling)")
+        if tool_stats:
+            print(f"[tools] generator: {tool_stats.get('generator', {})}")
+            print(f"[tools] solver: {tool_stats.get('solver', {})}")
+            print(f"[tools] reviewer: {tool_stats.get('reviewer', {})}")
+            print(f"[tools] total tool-call rounds: {tool_stats.get('total_rounds', 0)}")
+
+    # --- consolidated run summary (from the summarize graph node) ---
+    from puzzle_agent.summary import format_summary_dict, build_run_summary
+    if graph_summary is None:
+        # Parallel mode: the per-rule sub-graphs each summarized separately;
+        # build one combined summary from the aggregated records.
+        combined_state = {"accepted_records": records, "rejected_log": [],
+                          "rules": rules}
+        graph_summary = build_run_summary(combined_state, ctx=None).to_dict()
+    print()
+    print(format_summary_dict(graph_summary))
 
 
 if __name__ == "__main__":

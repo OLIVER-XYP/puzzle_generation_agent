@@ -181,6 +181,7 @@ class PuzzleAgent:
             output = self.pipeline.run(
                 r["rule_content"], r["title"], rid, r["examples"], r["target"],
                 require_reviewer_pass=False,
+                use_tools=self.pipeline.use_tools,  # respect pipeline-level setting
             )
             rec = {
                 "index": i + 1,
@@ -218,7 +219,8 @@ class PuzzleAgent:
             for i in range(count):
                 output = self.pipeline.run(
                     r["rule_content"], r["title"], rid, r["examples"], r["target"],
-                    require_reviewer_pass=False)
+                    require_reviewer_pass=False,
+                    use_tools=self.pipeline.use_tools)
                 rec = {"index": i+1, "question": output.question[:200] if output.question else "",
                        "answer": output.answer[:150] if output.answer else "",
                        "generator_ok": output.generator_ok,
