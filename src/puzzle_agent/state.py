@@ -4,7 +4,8 @@ from typing import Any, Dict, List, Optional, Set, TypedDict
 
 
 class GraphState(TypedDict, total=False):
-    # --- Studio input overrides ---
+    # --- Studio / natural language input ---
+    user_query: str                      # e.g. "给规则4生成5道题" — NL input
     rules: List[str]                     # e.g. ["1","5","10"] — override config
     count: int                           # e.g. 10 — override config
 
@@ -34,6 +35,9 @@ class GraphState(TypedDict, total=False):
     # dedup stores
     eval_hashes: List[str]              # from the original eval set (serialisable)
     accepted_hashes: List[str]         # synthesized-so-far
+
+    # natural language processing
+    _nl_result: Any                     # RewriteResult from query rewriter (internal)
 
     # outputs / logs
     accepted_records: List[Dict[str, Any]]

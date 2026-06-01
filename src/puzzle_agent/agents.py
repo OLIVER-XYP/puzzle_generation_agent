@@ -228,7 +228,7 @@ class SolverAgent:
     def __init__(self, client: LlmClient):
         self.client = client
 
-    def solve(self, rule_content: str, question: str) -> AgentResult:
+    def solve(self, rule_content: str, question: str, rule_id: str = "") -> AgentResult:
         prompt = build_rule_prompt(rule_content, "") + f"\n\n## Puzzle\n{question}"
         t0 = time.time()
         raw, latency = self.client.chat(SOLVER_SYSTEM, prompt, temperature=0.0, max_tokens=2048)
@@ -242,6 +242,11 @@ class SolverAgent:
         else:
             ans = raw.strip()
 
+        trace_call("solver", rule_id, 0, "solving",
+                   SOLVER_SYSTEM, prompt, raw,
+                   parsed={"answer": ans},
+                   model=self.client.model, temp=0.0,
+                   start_time=t0)
         return AgentResult("solver", raw, {"answer": ans}, [], latency_ms)
 
 
@@ -256,7 +261,7 @@ class ReviewerAgent:
         self.client = client
 
     def review(self, rule_content: str, question: str,
-               gen_answer: str, sol_answer: str) -> AgentResult:
+               gen_answer: str, sol_answer: str, rule_id: str = "") -> AgentResult:
         prompt = (
             f"## Puzzle Rule\n{rule_content}\n\n"
             f"## Puzzle Question\n{question}\n\n"
@@ -276,6 +281,11 @@ class ReviewerAgent:
         except (json.JSONDecodeError, AttributeError):
             parsed = {"verdict": "UNCLEAR", "score": 5, "issues": ["Could not parse reviewer output"]}
 
+        trace_call("reviewer", rule_id, 0, "reviewing",
+                   REVIEWER_SYSTEM, prompt, raw,
+                   parsed=parsed,
+                   model=self.client.model, temp=0.0,
+                   start_time=t0)
         return AgentResult("reviewer", raw, parsed, [], latency_ms)
 
 

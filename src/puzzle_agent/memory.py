@@ -498,6 +498,57 @@ class MemoryManager:
         row = self.ltm_store.fetchone("SELECT value FROM facts WHERE key=?", (key,))
         return json.loads(row["value"]) if row else None
 
+    def save_puzzles_batch(self, records: List[Dict[str, Any]]) -> int:
+        """Batch insert puzzles. Returns count."""
+        for puzzle in records:
+            self.save_puzzle(puzzle)
+        return len(records)
+
+    def log_generation_batch(self, entries: List[Dict[str, Any]]):
+        """Batch insert generation log entries."""
+        for e in entries:
+            self.log_generation(
+                e["rule_id"], e.get("agent_role", "verification"),
+                e.get("stage", "verify"), e.get("passed", False),
+                e.get("errors", []), e.get("latency_ms", 0),
+            )
+
+    def update_session_count(self, total: int):
+        """Update total_generated for the current session."""
+        if self.current_session_id:
+            self.ltm_store.execute(
+                "UPDATE sessions SET total_generated=? WHERE id=?",
+                (total, self.current_session_id),
+            )
+            self.ltm_store.commit()
+
+    def get_session_stats(self) -> Dict[str, Any]:
+        """Get statistics for the current session."""
+        if not self.current_session_id:
+            return {"error": "no active session"}
+        sid = self.current_session_id
+        row = self.ltm_store.fetchone(
+            "SELECT COUNT(*) as c FROM generation_log WHERE session_id=?", (sid,)
+        )
+        total_logs = row["c"] if row else 0
+        passed_row = self.ltm_store.fetchone(
+            "SELECT COUNT(*) as c FROM generation_log WHERE session_id=? AND passed=1", (sid,)
+        )
+        total_passed = passed_row["c"] if passed_row else 0
+        by_rule_rows = self.ltm_store.fetchall(
+            "SELECT rule_id, COUNT(*) as c, SUM(passed) as p "
+            "FROM generation_log WHERE session_id=? GROUP BY rule_id ORDER BY c DESC",
+            (sid,)
+        )
+        return {
+            "session_id": sid,
+            "total_logs": total_logs,
+            "total_passed": total_passed,
+            "pass_rate": round(total_passed / max(total_logs, 1), 3),
+            "by_rule": {r["rule_id"]: {"total": r["c"], "passed": r["p"] or 0}
+                       for r in by_rule_rows},
+        }
+
     def get_user_context(self) -> str:
         puzzles = self.get_puzzles(limit=200)
         by_rule: Dict[str, int] = {}
@@ -522,10 +573,12 @@ def create_memory(
     use_postgres: bool = False,
     redis_url: str = "",
     db_url: str = "",
+    db_path: str = "data/memory.db",
 ) -> MemoryManager:
     return MemoryManager(
         stm_backend="redis" if use_redis else "dict",
         ltm_backend="postgres" if use_postgres else "sqlite",
         redis_url=redis_url,
         db_url=db_url,
+        db_path=db_path,
     )

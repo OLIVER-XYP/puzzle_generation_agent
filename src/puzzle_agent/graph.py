@@ -17,7 +17,9 @@ from langgraph.graph import StateGraph, START, END
 
 from .config import load_config, resolve
 from .state import GraphState
-from .llm_gen import LlmGen, LlmRule
+from .llm_gen import LlmRule
+from .agents import MultiAgentPipeline
+from .memory import create_memory
 
 
 def _load_eval(cfg) -> Dict[str, List[Dict[str, Any]]]:
@@ -50,7 +52,7 @@ def _calibrate_target(examples: List[Dict[str, Any]]) -> Dict[str, Any]:
 class Context:
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
-        self.llm = LlmGen(cfg)
+        self.pipeline = MultiAgentPipeline(cfg)
         eval_by_rule = _load_eval(cfg)
 
         # Build simplified rule objects
@@ -72,6 +74,16 @@ class Context:
 
         self.rng = Random(cfg["run"]["seed"])
 
+        # Memory: two-tier persistence (STM + LTM)
+        mem_cfg = cfg.get("memory", {})
+        self.memory = create_memory(
+            use_redis=(mem_cfg.get("stm", "dict") == "redis"),
+            use_postgres=(mem_cfg.get("ltm", "sqlite") == "postgres"),
+            redis_url=mem_cfg.get("redis_url", ""),
+            db_url=mem_cfg.get("database_url", ""),
+            db_path=mem_cfg.get("db_path", "data/memory.db"),
+        )
+
 
 def build_context(cfg: Dict[str, Any]) -> Context:
     return Context(cfg)
@@ -82,8 +94,88 @@ def make_nodes(ctx: Context):
     count = cfg["run"]["count_per_rule"]
     max_retries = cfg["run"]["max_retries_per_item"]
 
+    # ---- Natural Language → Structured Intent ----
+    def rewrite_query(state: GraphState) -> GraphState:
+        """Process natural language input via QueryRewriter.
+
+        Only runs when user_query is provided and jobs haven't been set yet
+        (e.g., from LangGraph Studio input panel or API call).
+        Structured input (rules + count) bypasses this node.
+        """
+        user_query = state.get("user_query", "")
+        if not user_query or "jobs" in state:
+            return state  # already initialized or no NL input
+
+        from .rewriter import QueryRewriter
+        from .agents import LlmClient
+
+        # Build lightweight rewriter with rule index
+        rule_index = {}
+        for rid, rule in ctx.rules.items():
+            rule_index[rid] = {
+                "title": rule.title,
+                "tag": rule.tag,
+                "rule_content": rule.rule_content,
+                "examples": rule.examples,
+                "target": rule.target,
+            }
+
+        client = LlmClient(cfg)
+        rewriter = QueryRewriter(rule_index, client if client.enabled else None)
+        result = rewriter.rewrite(user_query)
+
+        # Extract generation intents
+        gen_intents = [i for i in result.intents if i.action == "GENERATE"]
+        inspect_intents = [i for i in result.intents if i.action == "INSPECT_RULE"]
+        other_intents = [i for i in result.intents if i.action not in ("GENERATE", "INSPECT_RULE")]
+
+        # Handle non-generation commands (list, stats, inspect, etc.)
+        if not gen_intents and (other_intents or inspect_intents):
+            # Non-generation request: set rules as hints, count=0 so no generation
+            req_rules = []
+            for intent in inspect_intents:
+                rid = intent.params.get("rule_id", "")
+                if rid and rid in ctx.rules:
+                    req_rules.append(rid)
+            if not req_rules:
+                req_rules = [cfg["run"]["rules"][0]]  # default: first rule
+            state.update(
+                user_query=user_query,
+                rules=req_rules,
+                count=0,
+                _nl_result=result,
+            )
+            return state
+
+        # Generation request: extract rules and count
+        req_rules = []
+        req_count = count
+        for intent in gen_intents:
+            rid = intent.params.get("rule_id", "")
+            c = intent.params.get("count", count)
+            if rid and rid in ctx.rules:
+                if rid not in req_rules:
+                    req_rules.append(rid)
+                req_count = c  # use the last count specified
+
+        if not req_rules:
+            # Fallback: if no specific rules extracted, use config defaults
+            req_rules = cfg["run"]["rules"]
+
+        # Set rules/count as hints; dispatcher will read them and build jobs
+        state.update(
+            user_query=user_query,
+            rules=req_rules,
+            count=req_count,
+            _nl_result=result,  # preserved for stats/output
+        )
+        return state
+
+    # ---- Job Dispatcher ----
     def dispatcher(state: GraphState) -> GraphState:
         if "jobs" not in state:
+            # --- session start ---
+            ctx.memory.start_session()
             # Allow Studio input override: {"rules": ["1","5"], "count": 10}
             req_rules = state.get("rules") or cfg["run"]["rules"]
             req_count = state.get("count") or count
@@ -124,6 +216,10 @@ def make_nodes(ctx: Context):
         with open(str(rep_path), "w", encoding="utf-8") as f:
             json.dump({"total": len(records), "per_rule": per_rule}, f, ensure_ascii=False, indent=2)
         state["output_path"] = str(ds_path)
+
+        # --- persistence: end session ---
+        ctx.memory.update_session_count(len(records))
+        ctx.memory.end_session(notes=f"wrote {len(records)} puzzles to {ds_path}")
         return state
 
     def difficulty_sampler(state: GraphState) -> GraphState:
@@ -135,18 +231,24 @@ def make_nodes(ctx: Context):
         rid = state["current_rule_id"]
         rule = ctx.rules[rid]
         item_id = f"syn-{rid}-{state['accepted_count']}"
-        result = ctx.llm.generate(
-            rule.rule_content, rule.title, rule.examples, rule.target,
-            rule_id=rid
+        output = ctx.pipeline.run(
+            rule.rule_content, rule.title, rid, rule.examples, rule.target,
+            require_reviewer_pass=False,
         )
-        if result:
+        if output.question and output.answer:
             state["candidate"] = {
                 "id": item_id, "rule_id": rid,
-                "question": result["question"],
-                "answer": result["answer"],
+                "question": output.question,
+                "answer": output.answer,
+                "plan": output.plan,
                 "difficulty": {},
                 "input_data": {"rule_id": rid, "idx": item_id},
-                "metadata": {},
+                "metadata": {
+                    "generator_ok": output.generator_ok,
+                    "solver_ok": output.solver_ok,
+                    "reviewer_score": output.reviewer_score,
+                    "reviewer_issues": output.reviewer_issues,
+                },
             }
         else:
             state["candidate"] = None
@@ -161,22 +263,33 @@ def make_nodes(ctx: Context):
             return state
         rid = state["current_rule_id"]
         rule = ctx.rules[rid]
-        # Ask LLM to independently solve
-        check = ctx.llm.cross_check(rule.rule_content, cand["question"])
-        matches = ctx.llm.answers_match(cand["answer"], check) if check else False
-        # Structural validation
+        # Independent Solver (temp=0, blind to Generator output)
+        sol_result = ctx.pipeline.solver.solve(
+            rule.rule_content, cand["question"], rule_id=rid,
+        )
+        sol_answer = sol_result.parsed.get("answer", "") if sol_result.parsed else ""
+        # Reviewer compares Generator vs Solver answers
+        rev_result = ctx.pipeline.reviewer.review(
+            rule.rule_content, cand["question"], cand["answer"], sol_answer,
+            rule_id=rid,
+        )
+        rev_data = rev_result.parsed or {}
+        answers_match = rev_data.get("answers_match", False) or rev_data.get("verdict") == "PASS"
+        # Deterministic structural validation
         from .validators import validate_answer
         struct_ok, struct_errors = validate_answer(rid, cand["answer"], cand["question"])
         state["solve_result"] = {
-            "num_solutions": 1 if matches else 0,
-            "unique": matches,
-            "solvable": matches and struct_ok,
-            "crosscheck_answer": check,
-            "crosscheck_ok": matches,
+            "num_solutions": 1 if answers_match else 0,
+            "unique": answers_match,
+            "solvable": answers_match and struct_ok,
+            "crosscheck_answer": sol_answer,
+            "crosscheck_ok": answers_match,
             "structural_ok": struct_ok,
             "structural_errors": struct_errors,
+            "reviewer_verdict": rev_data.get("verdict", "FAIL"),
+            "reviewer_score": rev_data.get("score", 0),
         }
-        cand["metadata"]["crosscheck_ok"] = matches
+        cand["metadata"]["crosscheck_ok"] = answers_match
         cand["metadata"]["structural_ok"] = struct_ok
         return state
 
@@ -217,6 +330,15 @@ def make_nodes(ctx: Context):
             state["item_retries"] = state.get("item_retries", 0) + 1
             state["rejected_log"].append(
                 {"rule": state["current_rule_id"], "reasons": reasons})
+
+        # --- persistence: log every verification attempt ---
+        ctx.memory.log_generation(
+            rule_id=state["current_rule_id"],
+            agent_role="verification",
+            stage="verify",
+            passed=len(reasons) == 0,
+            errors=list(reasons),
+        )
         return state
 
     def route_verify(state: GraphState) -> str:
@@ -255,6 +377,9 @@ def make_nodes(ctx: Context):
         state["candidate"] = None
         pr = state["stats"]["per_rule"].setdefault(rid, {"accepted": 0})
         pr["accepted"] = n
+
+        # --- persistence: save accepted puzzle ---
+        ctx.memory.save_puzzle(record)
         return state
 
     def route_after_accept(state: GraphState) -> str:
@@ -262,6 +387,7 @@ def make_nodes(ctx: Context):
         return "dispatcher" if state["accepted_count"] >= job["count"] else "llm_synthesizer"
 
     return dict(
+        rewrite_query=rewrite_query,
         dispatcher=dispatcher, route_dispatch=route_dispatch,
         difficulty_sampler=difficulty_sampler,
         llm_synthesizer=llm_synthesizer, llm_crosscheck=llm_crosscheck,
@@ -273,6 +399,7 @@ def make_nodes(ctx: Context):
 def build_graph(ctx: Context):
     n = make_nodes(ctx)
     g = StateGraph(GraphState)
+    g.add_node("rewrite_query", n["rewrite_query"])
     g.add_node("dispatcher", n["dispatcher"])
     g.add_node("llm_synthesizer", n["llm_synthesizer"])
     g.add_node("llm_crosscheck", n["llm_crosscheck"])
@@ -280,7 +407,9 @@ def build_graph(ctx: Context):
     g.add_node("data_preprocessor", n["data_preprocessor"])
     g.add_node("save_output", n["save_output"])
 
-    g.add_edge(START, "dispatcher")
+    # START → rewrite_query (NL→Intent) → dispatcher → ...
+    g.add_edge(START, "rewrite_query")
+    g.add_edge("rewrite_query", "dispatcher")
     g.add_conditional_edges("dispatcher", n["route_dispatch"],
                             {"llm_synthesizer": "llm_synthesizer", "save_output": "save_output"})
     g.add_edge("llm_synthesizer", "llm_crosscheck")

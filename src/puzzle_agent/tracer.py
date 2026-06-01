@@ -74,6 +74,9 @@ class SFTDecision:
     samples_needed: int
     recommendation: str
 
+    def priority_order(self) -> int:
+        return {"HIGH": 3, "MEDIUM": 2, "LOW": 1}.get(self.priority, 0)
+
 
 class Tracer:
     """Records all LLM calls and generates diagnoses."""
@@ -245,12 +248,12 @@ def trace_call(agent_role: str, rule_id: str, attempt: int, stage: str,
         e0 = errs[0].lower()
         if any(w in e0 for w in ["parse", "json"]):
             cat = "parse"
-        elif any(w in e0 for w in ["structural", "invalid", "row", "column", "duplicate"]):
+        elif "duplicate" in e0:
+            cat = "duplicate"
+        elif any(w in e0 for w in ["structural", "invalid", "row", "column"]):
             cat = "structure"
         elif "crosscheck" in e0:
             cat = "crosscheck"
-        elif "duplicate" in e0:
-            cat = "duplicate"
         elif "format" in e0:
             cat = "format"
 
