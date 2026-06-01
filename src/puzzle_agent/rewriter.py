@@ -34,6 +34,76 @@ DIFFICULTY_ALIASES = {
     "困难": "long", "难": "long", "复杂": "long", "hard": "long",
 }
 
+# Rule-name aliases (Chinese + English) → rule_id.
+# Lets users say "摩天大楼"/"skyscraper" instead of "规则25".
+RULE_NAME_ALIASES = {
+    # 1-8, 24 (word)
+    "脑筋急转弯": "1", "word brain": "1", "brain teaser": "1",
+    "词根": "2", "词缀": "2", "affix": "2", "root": "2",
+    "连词": "3", "组词": "3", "connect word": "3",
+    "字母重排": "4", "变位词": "4", "anagram": "4",
+    "密码数学": "5", "加密数学": "5", "crypto": "5", "cryptarithm": "5",
+    "单词阶梯": "6", "词梯": "6", "word ladder": "6",
+    "逻辑": "7", "逻辑谜题": "7", "logic": "7",
+    "单词搜索": "8", "找词": "8", "word search": "8",
+    "填字": "24", "wordscape": "24",
+    # 9-17, 25 (math)
+    "数学路径": "9", "math path": "9",
+    "24点": "10", "二十四点": "10", "24 point": "10", "24points": "10",
+    "survo": "11",
+    "kukurasu": "12", "库库拉苏": "12",
+    "numbrix": "13", "数字接龙": "13",
+    "数字墙": "14", "number wall": "14",
+    "数独": "15", "sudoku": "15", "sudoko": "15",
+    "计算数独": "16", "calcudoku": "16", "calcudoko": "16", "kenken": "16",
+    "不等式": "17", "futoshiki": "17",
+    "摩天大楼": "25", "摩天楼": "25", "skyscraper": "25", "skyscrapers": "25",
+    # 18-23 (spatial)
+    "向量": "18", "矢量": "18", "vector": "18",
+    "星战": "19", "星空": "19", "star battle": "19",
+    "露营": "20", "帐篷": "20", "campsite": "20", "tents": "20",
+    "扫雷": "21", "minesweeper": "21",
+    "箭头迷宫": "22", "arrow maze": "22",
+    "norinori": "23", "诺里诺里": "23",
+}
+
+# Chinese numerals → int (for "两道", "三个", "十题" ...)
+CN_NUMERALS = {
+    "零": 0, "一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
+
+
+def _parse_count(query: str) -> Optional[int]:
+    """Extract a count from query: Arabic digits OR Chinese numerals."""
+    m = re.search(r'(\d+)\s*(?:个|道|题|条|次|puzzle|each)', query)
+    if m:
+        return int(m.group(1))
+    m2 = re.search(r'(?:each|per)\s+(\d+)', query)
+    if m2:
+        return int(m2.group(1))
+    # English: "give me 2 ...", "generate 3 ...", "make 5 ..."
+    m_en = re.search(r'(?:give\s+me|give|generate|make|create|want|add|need)\s+(\d+)', query)
+    if m_en:
+        return int(m_en.group(1))
+    # Chinese numeral immediately before a counter word
+    m3 = re.search(r'([零一两二三四五六七八九十]+)\s*(?:个|道|题|条|次)', query)
+    if m3:
+        return _cn_to_int(m3.group(1))
+    return None
+
+
+def _cn_to_int(s: str) -> int:
+    """Convert simple Chinese numeral string to int (supports 1-99)."""
+    if s in CN_NUMERALS:
+        return CN_NUMERALS[s]
+    if "十" in s:
+        parts = s.split("十")
+        tens = CN_NUMERALS.get(parts[0], 1) if parts[0] else 1
+        ones = CN_NUMERALS.get(parts[1], 0) if len(parts) > 1 and parts[1] else 0
+        return tens * 10 + ones
+    return CN_NUMERALS.get(s, 1)
+
 
 @dataclass
 class ParsedIntent:
@@ -139,14 +209,8 @@ class QueryRewriter:
         # GENERATE or INSPECT
         rule_ids = self._extract_rule_ids(query)
         if rule_ids:
-            count = 1
-            cm = re.search(r'(\d+)\s*(?:个|道|题|条|次|puzzle|each)', query)
-            if cm:
-                count = int(cm.group(1))
-            # Also "each N" / "per N" pattern
-            cm2 = re.search(r'(?:each|per)\s+(\d+)', query)
-            if cm2:
-                count = int(cm2.group(1))
+            count_explicit = _parse_count(query)
+            count = count_explicit or 1
 
             bucket = "medium"
             for dk, dv in DIFFICULTY_ALIASES.items():
@@ -158,7 +222,12 @@ class QueryRewriter:
                 intents.append(ParsedIntent("INSPECT_RULE", {"rule_id": rule_ids[0]}))
                 return RewriteResult(query, intents)
 
-            if any(w in query for w in ["生成", "出题", "造题", "generate", "题目", "编", "give", "create", "make", "add", "more", "another", "再", "加", "each"]):
+            gen_verbs = ["生成", "出题", "出", "造题", "造", "做", "generate", "题目",
+                         "问题", "编", "给我", "给", "想要", "要", "来", "give",
+                         "create", "make", "add", "more", "another", "再", "加", "each"]
+            # An explicit count ("十道", "3个") is itself a generation signal,
+            # even without a verb (e.g. "十道困难的数独").
+            if any(w in query for w in gen_verbs) or count_explicit is not None:
                 # Multi-rule support: "each for rules 1,2,3" or "rules 10 and 25 each 2"
                 is_multi = any(w in query for w in ["each", "各", "每", "分别", "都"])
                 target_rids = rule_ids if is_multi else [rule_ids[0]]
@@ -173,10 +242,7 @@ class QueryRewriter:
         # Domain-based: "出几道数学题" / "来点数学题"
         for domain, rids in DOMAIN_MAP.items():
             if domain in query and any(w in query for w in ["生成", "出题", "出", "造", "题目", "来点", "弄点"]):
-                count = 1
-                cm = re.search(r'(\d+)\s*(?:个|道)', query)
-                if cm:
-                    count = int(cm.group(1))
+                count = _parse_count(query) or 1
                 bucket = "medium"
                 for dk, dv in DIFFICULTY_ALIASES.items():
                     if dk in query:
@@ -253,16 +319,23 @@ class QueryRewriter:
         )
 
     def _extract_rule_ids(self, query: str) -> List[str]:
-        """Extract ALL 1-25 numbers found after 'rule'/'rules'/'规则' markers.
+        """Extract rule IDs from numeric markers AND named aliases.
 
-        Simple approach: find every occurrence of 'rule'/'规则' followed by
-        digit(s), then collect all digits in that clause. This is the most
-        reliable signal for rule identification.
+        1. Numbers after 'rule'/'规则'.
+        2. Rule names ("摩天大楼", "数独", "sudoku" ...) via RULE_NAME_ALIASES.
+        3. Fallback: bare 1-25 numbers that are not counts.
         """
         q = query.lower()
         found = []
 
-        # Find clauses: 'rule X' or 'rule X and Y' or 'rules X,Y,Z'
+        # 1. Named rule aliases (longest first to avoid partial-match collisions)
+        for alias in sorted(RULE_NAME_ALIASES, key=len, reverse=True):
+            if alias in q:
+                rid = RULE_NAME_ALIASES[alias]
+                if rid not in found:
+                    found.append(rid)
+
+        # 2. Clauses: 'rule X' or 'rule X and Y' or 'rules X,Y,Z'
         for m in re.finditer(
             r'(?:rules?|规则)\s*((?:1[0-9]|2[0-5]|[1-9])(?:[\s,，、]*(?:and|和|与)?[\s,，、]*(?:1[0-9]|2[0-5]|[1-9]))*)',
             q
@@ -273,8 +346,7 @@ class QueryRewriter:
                 if n not in found:
                     found.append(n)
 
-        # Fallback: if no 'rule' marker found, look for bare 1-25 numbers
-        # that are clearly NOT count words
+        # 3. Fallback: bare 1-25 numbers that are clearly NOT count words
         if not found:
             all_nums = re.findall(r'\b(1[0-9]|2[0-5]|[1-9])\b', q)
             count_words = r'puzzles?|each|个|道|题|条|more|additional'
