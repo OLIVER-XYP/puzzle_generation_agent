@@ -13,7 +13,7 @@ generator:
   provider: deepseek
   model: deepseek-chat
   base_url: https://api.deepseek.com
-  api_key: "sk-16d0ee12d10543229b9f2c3a77a1f732"
+  api_key: ""                    # leave blank; loaded from DEEPSEEK_API_KEY env / .env
   temperature: 0.7
   max_generation_attempts: 5     # self-correction retries
   max_output_tokens: 4096
