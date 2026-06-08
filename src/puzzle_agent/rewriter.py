@@ -31,7 +31,8 @@ DOMAIN_MAP = {
 DIFFICULTY_ALIASES = {
     "简单": "short", "容易": "short", "短": "short", "easy": "short",
     "中等": "medium", "普通": "medium", "一般": "medium", "mid": "medium",
-    "困难": "long", "难": "long", "复杂": "long", "hard": "long",
+    "困难": "long", "难": "long", "难一点": "long", "难一些": "long",
+    "难些": "long", "复杂": "long", "烧脑": "long", "hard": "long",
 }
 
 # Rule-name aliases (Chinese + English) → rule_id.
@@ -107,7 +108,7 @@ def _cn_to_int(s: str) -> int:
 
 @dataclass
 class ParsedIntent:
-    action: str                      # "LIST_RULES" | "INSPECT_RULE" | "GENERATE" | "VALIDATE" | "EXPORT" | "STATS" | "HELP"
+    action: str                      # LIST_RULES | INSPECT_RULE | GENERATE | VALIDATE | EXPORT | STATS | HELP | RECOMMEND
     params: Dict[str, Any] = field(default_factory=dict)
     confidence: float = 1.0
 
@@ -134,11 +135,11 @@ class QueryRewriter:
         query_lower = query.lower().strip()
 
         # ---- Fast path: simple queries handled by regex ----
-        fast = self._fast_path(query_lower)
+        fast = self._fast_path(query_lower, session_summary)
 
         # ---- Compound query detection: try to split and parse each part ----
         if self._is_compound(query_lower):
-            compound = self._parse_compound(query_lower)
+            compound = self._parse_compound(query_lower, session_summary)
             if compound and compound.intents:
                 return compound
 
@@ -152,20 +153,20 @@ class QueryRewriter:
             llm_result.intents = fast.intents + llm_result.intents
         return llm_result
 
-    def _parse_compound(self, query: str) -> Optional[RewriteResult]:
+    def _parse_compound(self, query: str, session_summary: str = "") -> Optional[RewriteResult]:
         """Split compound query on connectors and parse each part separately.
 
         E.g. "看规则25然后各出2道" → inspect(25) + generate(25,2)
         """
         import re
         # Split on common connectors
-        parts = re.split(r'(?:然后|接着|再|并且|还有|，|,)\s*', query)
+        parts = re.split(r'(?:然后|接着|并且|还有|，|,)\s*', query)
         if len(parts) <= 1:
             return None
 
         all_intents = []
         for part in parts:
-            r = self._fast_path(part.strip())
+            r = self._fast_path(part.strip(), session_summary)
             if r and r.intents:
                 all_intents.extend(r.intents)
 
@@ -173,9 +174,10 @@ class QueryRewriter:
             return RewriteResult(query, all_intents)
         return None
 
-    def _fast_path(self, query: str) -> Optional[RewriteResult]:
+    def _fast_path(self, query: str, session_summary: str = "") -> Optional[RewriteResult]:
         """Regex-based parsing for simple, unambiguous queries."""
         intents = []
+        context_rules = self._context_rule_ids(session_summary)
 
         # LIST
         if any(w in query for w in ["list", "列出", "所有规则", "有哪些规则", "什么规则"]):
@@ -190,6 +192,13 @@ class QueryRewriter:
         # STATS
         if any(w in query for w in ["统计", "生成了多少", "进度"]):
             intents.append(ParsedIntent("STATS"))
+            return RewriteResult(query, intents)
+
+        # RECOMMEND / NEXT-BEST-ACTION
+        if any(w in query for w in [
+            "推荐", "下一步", "接下来", "适合", "该做什么", "recommend", "suggest", "next"
+        ]):
+            intents.append(ParsedIntent("RECOMMEND", {"limit": _parse_count(query) or 3}))
             return RewriteResult(query, intents)
 
         # VALIDATE
@@ -207,7 +216,20 @@ class QueryRewriter:
             return RewriteResult(query, intents)
 
         # GENERATE or INSPECT
+        domain_rules = self._extract_domain_rules(query)
         rule_ids = self._extract_rule_ids(query)
+        strong_domain_signal = any(w in query for w in ["网格", "宫格", "grid"])
+        if rule_ids and domain_rules and (
+            strong_domain_signal
+            or (any(w in query for w in ["类似", "像", "like"]) and any(w in query for w in ["不要", "不是", "不一样", "换个", "not"]))
+        ):
+            rule_ids = []
+        followup_generate = self._is_followup_generate(query)
+        if not rule_ids and followup_generate and context_rules:
+            if any(w in query for w in ["都", "各", "each", "all"]):
+                rule_ids = context_rules[:3]
+            else:
+                rule_ids = [context_rules[0]]
         if rule_ids:
             count_explicit = _parse_count(query)
             count = count_explicit or 1
@@ -224,7 +246,8 @@ class QueryRewriter:
 
             gen_verbs = ["生成", "出题", "出", "造题", "造", "做", "generate", "题目",
                          "问题", "编", "给我", "给", "想要", "要", "来", "give",
-                         "create", "make", "add", "more", "another", "再", "加", "each"]
+                         "create", "make", "add", "more", "another", "再", "加", "each",
+                         "继续", "类似", "刚才", "上次", "那种", "同样"]
             # An explicit count ("十道", "3个") is itself a generation signal,
             # even without a verb (e.g. "十道困难的数独").
             if any(w in query for w in gen_verbs) or count_explicit is not None:
@@ -239,21 +262,21 @@ class QueryRewriter:
                     }))
                 return RewriteResult(query, intents)
 
-        # Domain-based: "出几道数学题" / "来点数学题"
-        for domain, rids in DOMAIN_MAP.items():
-            if domain in query and any(w in query for w in ["生成", "出题", "出", "造", "题目", "来点", "弄点"]):
-                count = _parse_count(query) or 1
-                bucket = "medium"
-                for dk, dv in DIFFICULTY_ALIASES.items():
-                    if dk in query:
-                        bucket = dv
-                        break
-                for rid in rids[:3]:  # limit to 3 rules
-                    intents.append(ParsedIntent("GENERATE", {
-                        "rule_id": rid, "count": count, "bucket": bucket,
-                    }))
-                if intents:
-                    return RewriteResult(query, intents)
+        # Domain-based and fuzzy category requests:
+        # "出几道数学题" / "来点文字类" / "类似数独但不一样" / "烧脑推理"
+        if domain_rules and self._is_generate_request(query):
+            count = _parse_count(query) or 1
+            bucket = "medium"
+            for dk, dv in DIFFICULTY_ALIASES.items():
+                if dk in query:
+                    bucket = dv
+                    break
+            for rid in domain_rules[:3]:
+                intents.append(ParsedIntent("GENERATE", {
+                    "rule_id": rid, "count": count, "bucket": bucket,
+                }))
+            if intents:
+                return RewriteResult(query, intents)
 
         return None
 
@@ -337,11 +360,11 @@ class QueryRewriter:
 
         # 2. Clauses: 'rule X' or 'rule X and Y' or 'rules X,Y,Z'
         for m in re.finditer(
-            r'(?:rules?|规则)\s*((?:1[0-9]|2[0-5]|[1-9])(?:[\s,，、]*(?:and|和|与)?[\s,，、]*(?:1[0-9]|2[0-5]|[1-9]))*)',
+            r'(?:rules?|规则)\s*((?:1[0-9]|2[0-5]|[1-9])(?:[\s,，、]*(?:and|和|与|及)?[\s,，、]*(?:1[0-9]|2[0-5]|[1-9]))*)',
             q
         ):
             clause = m.group(1)
-            nums = re.findall(r'\b(1[0-9]|2[0-5]|[1-9])\b', clause)
+            nums = re.findall(r'(1[0-9]|2[0-5]|[1-9])', clause)
             for n in nums:
                 if n not in found:
                     found.append(n)
@@ -357,9 +380,73 @@ class QueryRewriter:
 
         return sorted(set(found), key=lambda x: (int(x), x))
 
+    def _context_rule_ids(self, session_summary: str) -> List[str]:
+        """Extract recent rule ids from SessionManager.describe_context output."""
+        if not session_summary:
+            return []
+        found = []
+        for m in re.finditer(r"Rule\s+([0-9]{1,2})", session_summary, flags=re.IGNORECASE):
+            rid = m.group(1)
+            if 1 <= int(rid) <= 25 and rid not in found:
+                found.append(rid)
+        return found
+
+    def _is_followup_generate(self, query: str) -> bool:
+        return any(w in query for w in [
+            "再来", "再出", "继续", "补", "加", "更多", "more", "another",
+            "类似", "像刚才", "刚才那种", "上次那种", "同样", "same"
+        ])
+
+    def _is_generate_request(self, query: str) -> bool:
+        if any(w in query for w in [
+            "生成", "出题", "出", "造", "题目", "来点", "弄点", "给我", "来",
+            "想做", "想要", "练", "挑战", "generate", "make", "create", "give"
+        ]):
+            return True
+        return _parse_count(query) is not None
+
+    def _extract_domain_rules(self, query: str) -> List[str]:
+        rules: List[str] = []
+        negative_math = any(w in query for w in ["不要数学", "非数学", "不想数学", "not math"])
+        negative_word = any(w in query for w in ["不要字谜", "不要文字", "非文字", "not word"])
+        negative_spatial = any(w in query for w in ["不要空间", "非空间", "not spatial"])
+
+        if any(w in query for w in ["网格", "宫格", "grid"]):
+            rules.extend(["11", "12", "13", "15", "16", "17", "25"])
+        if any(w in query for w in ["推理", "逻辑", "烧脑", "logic"]):
+            rules.extend(["7", "15", "17", "25"])
+        if any(w in query for w in ["类似数独", "像数独", "like sudoku"]):
+            rules.extend(["16", "17", "25"])
+        if any(w in query for w in ["类似24", "像24", "like 24"]):
+            rules.extend(["9", "11", "12"])
+        for domain, rids in DOMAIN_MAP.items():
+            if domain in query:
+                rules.extend(rids)
+
+        if any(w in query for w in ["文字", "单词", "词语", "语言"]):
+            rules.extend(DOMAIN_MAP["word"])
+        if any(w in query for w in ["计算", "数字", "算术"]):
+            rules.extend(DOMAIN_MAP["math"])
+        if "not sudoku" in query or "不要数独" in query:
+            rules = [r for r in rules if r != "15"]
+        if "not 24" in query or "不要24" in query or "换个形式" in query:
+            rules = [r for r in rules if r != "10"]
+
+        deduped = []
+        for rid in rules:
+            if negative_math and rid in DOMAIN_MAP["math"]:
+                continue
+            if negative_word and rid in DOMAIN_MAP["word"]:
+                continue
+            if negative_spatial and rid in DOMAIN_MAP["spatial"]:
+                continue
+            if rid not in deduped:
+                deduped.append(rid)
+        return deduped
+
     def _is_compound(self, query: str) -> bool:
         """Check if query likely has multiple intents."""
-        compound_markers = ["然后", "接着", "再", "并且", "还有", "以及", "另外", "同时", "之后"]
+        compound_markers = ["然后", "接着", "并且", "还有", "以及", "另外", "同时", "之后"]
         return any(m in query for m in compound_markers)
 
 

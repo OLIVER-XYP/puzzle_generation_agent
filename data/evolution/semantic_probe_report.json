@@ -1,0 +1,239 @@
+{
+  "created_at": "2026-06-08T20:34:10",
+  "total": 10,
+  "passed": 10,
+  "pass_rate": 1.0,
+  "results": [
+    {
+      "probe_id": "followup_same_rule",
+      "passed": true,
+      "errors": [],
+      "actual": {
+        "actions": [
+          "GENERATE"
+        ],
+        "rules": [
+          "10"
+        ],
+        "buckets": [
+          "long"
+        ],
+        "clarification_needed": false
+      }
+    },
+    {
+      "probe_id": "domain_fuzzy_math_hard",
+      "passed": true,
+      "errors": [],
+      "actual": {
+        "actions": [
+          "GENERATE",
+          "GENERATE",
+          "GENERATE"
+        ],
+        "rules": [
+          "11",
+          "12",
+          "13"
+        ],
+        "buckets": [
+          "long",
+          "long",
+          "long"
+        ],
+        "clarification_needed": false
+      }
+    },
+    {
+      "probe_id": "similar_sudoku_not_same",
+      "passed": true,
+      "errors": [],
+      "actual": {
+        "actions": [
+          "GENERATE",
+          "GENERATE",
+          "GENERATE"
+        ],
+        "rules": [
+          "16",
+          "17",
+          "25"
+        ],
+        "buckets": [
+          "medium",
+          "medium",
+          "medium"
+        ],
+        "clarification_needed": false
+      }
+    },
+    {
+      "probe_id": "recommend_next",
+      "passed": true,
+      "errors": [],
+      "actual": {
+        "actions": [
+          "RECOMMEND"
+        ],
+        "rules": [],
+        "buckets": [],
+        "clarification_needed": false,
+        "recommendations": [
+          {
+            "rule_id": "10",
+            "title": "24 points",
+            "tag": "math",
+            "score": 13.0,
+            "reason": "matches frequently requested rule"
+          },
+          {
+            "rule_id": "9",
+            "title": "Math Path",
+            "tag": "math",
+            "score": 4.0,
+            "reason": "matches preferred math category"
+          },
+          {
+            "rule_id": "11",
+            "title": "Survo",
+            "tag": "math",
+            "score": 4.0,
+            "reason": "matches preferred math category"
+          }
+        ]
+      }
+    },
+    {
+      "probe_id": "multi_rule_each",
+      "passed": true,
+      "errors": [],
+      "actual": {
+        "actions": [
+          "GENERATE",
+          "GENERATE"
+        ],
+        "rules": [
+          "10",
+          "25"
+        ],
+        "buckets": [
+          "medium",
+          "medium"
+        ],
+        "clarification_needed": false
+      }
+    },
+    {
+      "probe_id": "word_not_math",
+      "passed": true,
+      "errors": [],
+      "actual": {
+        "actions": [
+          "GENERATE",
+          "GENERATE",
+          "GENERATE"
+        ],
+        "rules": [
+          "1",
+          "2",
+          "3"
+        ],
+        "buckets": [
+          "medium",
+          "medium",
+          "medium"
+        ],
+        "clarification_needed": false
+      }
+    },
+    {
+      "probe_id": "followup_all_recent_rules",
+      "passed": true,
+      "errors": [],
+      "actual": {
+        "actions": [
+          "GENERATE",
+          "GENERATE"
+        ],
+        "rules": [
+          "10",
+          "25"
+        ],
+        "buckets": [
+          "medium",
+          "medium"
+        ],
+        "clarification_needed": false
+      }
+    },
+    {
+      "probe_id": "analog_24_not_24",
+      "passed": true,
+      "errors": [],
+      "actual": {
+        "actions": [
+          "GENERATE",
+          "GENERATE",
+          "GENERATE"
+        ],
+        "rules": [
+          "9",
+          "11",
+          "12"
+        ],
+        "buckets": [
+          "medium",
+          "medium",
+          "medium"
+        ],
+        "clarification_needed": false
+      }
+    },
+    {
+      "probe_id": "negative_spatial_math",
+      "passed": true,
+      "errors": [],
+      "actual": {
+        "actions": [
+          "GENERATE",
+          "GENERATE",
+          "GENERATE"
+        ],
+        "rules": [
+          "7",
+          "15",
+          "17"
+        ],
+        "buckets": [
+          "medium",
+          "medium",
+          "medium"
+        ],
+        "clarification_needed": false
+      }
+    },
+    {
+      "probe_id": "english_fuzzy_grid",
+      "passed": true,
+      "errors": [],
+      "actual": {
+        "actions": [
+          "GENERATE",
+          "GENERATE",
+          "GENERATE"
+        ],
+        "rules": [
+          "11",
+          "12",
+          "13"
+        ],
+        "buckets": [
+          "long",
+          "long",
+          "long"
+        ],
+        "clarification_needed": false
+      }
+    }
+  ]
+}

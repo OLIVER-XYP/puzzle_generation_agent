@@ -405,7 +405,7 @@ class MemoryManager:
     # ---- Session ----
 
     def start_session(self) -> str:
-        sid = datetime.now().strftime("sess-%Y%m%d-%H%M%S")
+        sid = datetime.now().strftime("sess-%Y%m%d-%H%M%S-%f")
         self.ltm_store.execute(
             "INSERT INTO sessions (id) VALUES (?)", (sid,)
         )

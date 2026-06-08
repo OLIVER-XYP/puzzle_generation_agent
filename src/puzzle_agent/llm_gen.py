@@ -198,7 +198,7 @@ class LlmGen:
         if not self.enabled:
             return None
         client = self._client
-        model = self.cfg.get("model", "deepseek-chat")
+        model = self.cfg.get("model", "deepseek-v4-pro")
         try:
             resp = client.chat.completions.create(
                 model=model,

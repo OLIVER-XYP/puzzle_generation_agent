@@ -11,12 +11,12 @@ run:
 generator:
   enabled: true
   provider: deepseek
-  model: deepseek-chat
+  model: deepseek-v4-pro
   base_url: https://api.deepseek.com
   api_key: ""                    # leave blank; loaded from DEEPSEEK_API_KEY env / .env
   temperature: 0.7
   max_generation_attempts: 5     # self-correction retries
-  max_output_tokens: 4096
+  max_output_tokens: 32768       # reasoning model (v4-pro): CoT can be long
   use_reasoner: false            # set true for CoT-heavy rules
   use_tools: true                # LLM function calling (Generator/Solver/Reviewer) — ON by default
 
@@ -35,6 +35,24 @@ memory:
   redis_url: ""                # $REDIS_URL
   database_url: ""             # $DATABASE_URL
   db_path: data/memory.db
+
+user_memory:
+  enabled: true
+  default_user_id: default
+  max_context_chars: 1200
+
+benchmark:
+  rules: ["4", "10", "15", "25"]
+  count_per_rule: 3
+  seed: 20260608
+  out_dir: data/evolution
+
+evolution:
+  enabled: true
+  active_prompt_version: builtin
+  max_candidates: 3
+  promote_min_score_delta: 0.05
+  max_rule_regression: 0.10
 
 dedup:
   use_symmetry: true

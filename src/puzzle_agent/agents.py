@@ -19,10 +19,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from .prompt_builder import (
-    GENERATOR_SYSTEM, SOLVER_SYSTEM, REVIEWER_SYSTEM,
     build_rule_prompt, ExampleSelector, format_examples,
-    build_task_prompt, estimate_tokens, PromptBudget,
+    build_task_prompt, PromptBudget,
 )
+from .prompt_provider import PromptProvider, create_prompt_provider
 from .tracer import trace_call, get_tracer
 from .tools import (
     ToolExecutor, ToolResult,
@@ -58,7 +58,7 @@ class LlmClient:
 
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
-        self.model = cfg.get("generator", {}).get("model", "deepseek-chat")
+        self.model = cfg.get("generator", {}).get("model", "deepseek-v4-pro")
         self.base_url = cfg.get("generator", {}).get("base_url", "https://api.deepseek.com")
         api_key = cfg.get("generator", {}).get("api_key", "")
         if not api_key:
@@ -149,8 +149,10 @@ class LlmClient:
 class GeneratorAgent:
     """Creates puzzles with planning-guided generation + optional tool-assisted verification."""
 
-    def __init__(self, client: LlmClient, max_attempts: int = 3):
+    def __init__(self, client: LlmClient, prompt_provider: PromptProvider,
+                 max_attempts: int = 3):
         self.client = client
+        self.prompt_provider = prompt_provider
         self.max_attempts = max_attempts
         self.tool_stats: Dict[str, int] = {"calls": 0, "tool_rounds": 0}
 
@@ -159,6 +161,7 @@ class GeneratorAgent:
         examples: List[Dict], target: Dict,
         prior_errors: List[str] = None,
         use_tools: bool = False,
+        memory_context: str = "",
     ) -> AgentResult:
         selector = ExampleSelector(examples)
         avg_len = target.get("q_len_avg", 400) if target else 400
@@ -167,15 +170,17 @@ class GeneratorAgent:
         errors = list(prior_errors or [])
 
         for attempt in range(self.max_attempts):
+            prompts = self.prompt_provider.load()
+            generator_system = prompts.generator
             # Build prompt
             selected = selector.select(n=3, target_bucket=bucket)
             rule_block = build_rule_prompt(rule_content, rule_title)
             budget = PromptBudget()
-            budget.add(GENERATOR_SYSTEM)
+            budget.add(generator_system)
             budget.add(rule_block)
             trimmed = budget.truncate_examples(selected, max_tokens=3000)
             ex_block = "## Examples\n" + format_examples(trimmed)
-            task_block = build_task_prompt(target, errors)
+            task_block = build_task_prompt(target, errors, memory_context=memory_context)
 
             full_prompt = "\n\n".join([rule_block, ex_block, task_block])
 
@@ -183,20 +188,38 @@ class GeneratorAgent:
             t0 = time.time()
             if use_tools and self.client.enabled:
                 tools = get_tool_schemas_for_role("generator")
-                tool_result = self.client.chat_with_tools(
-                    GENERATOR_SYSTEM, full_prompt,
-                    tools=tools,
-                    temperature=0.7 + attempt * 0.1,
-                    max_tokens=4096,
-                    max_rounds=4,
+                messages = [
+                    {"role": "system", "content": generator_system},
+                    {"role": "user", "content": full_prompt},
+                ]
+                tool_result = self.client.tool_executor.run_loop(
+                    client=self.client, messages=messages, tools=tools,
+                    temperature=0.7 + attempt * 0.1, max_tokens=32768,
+                    max_rounds=7,  # leave room to emit JSON after tool-verify
                 )
                 raw = tool_result.text
                 self.tool_stats["calls"] += 1
                 self.tool_stats["tool_rounds"] += tool_result.total_tool_calls
+
+                # If the model rambled instead of committing to JSON, force a
+                # JSON-only finalization that keeps its tool-verified context.
+                probe, _ = self._parse(raw)
+                if probe is None:
+                    messages.append({"role": "user", "content":
+                        "Stop reasoning. Output ONLY the final JSON object now, "
+                        "nothing else, no tool calls:\n"
+                        '{"planning": "...", "question": "...", "answer": "[[...]]"}\n'
+                        "The answer field MUST be wrapped in [[ and ]]."})
+                    fr = self.client.chat_raw(
+                        messages=messages, tools=None,
+                        temperature=0.3, max_tokens=32768,
+                    )
+                    if fr is not None:
+                        raw = fr.choices[0].message.content or raw
             else:
                 raw, _ = self.client.chat(
-                    GENERATOR_SYSTEM, full_prompt,
-                    temperature=0.7 + attempt * 0.1, max_tokens=4096,
+                    generator_system, full_prompt,
+                    temperature=0.7 + attempt * 0.1, max_tokens=32768,
                 )
             latency = int((time.time() - t0) * 1000)
 
@@ -205,7 +228,7 @@ class GeneratorAgent:
             if parse_errs:
                 errors = parse_errs
                 trace_call("generator", rule_id, attempt, "parsing",
-                          GENERATOR_SYSTEM, full_prompt, raw,
+                          generator_system, full_prompt, raw,
                           errors=errors, model=self.client.model, temp=0.7)
                 continue
 
@@ -214,7 +237,7 @@ class GeneratorAgent:
             if fmt_errs:
                 errors = fmt_errs
                 trace_call("generator", rule_id, attempt, "format_validation",
-                          GENERATOR_SYSTEM, full_prompt, raw, parsed=parsed,
+                          generator_system, full_prompt, raw, parsed=parsed,
                           errors=errors, model=self.client.model, temp=0.7)
                 continue
 
@@ -224,12 +247,12 @@ class GeneratorAgent:
             if not struct_ok:
                 errors = struct_errs
                 trace_call("generator", rule_id, attempt, "structural_validation",
-                          GENERATOR_SYSTEM, full_prompt, raw, parsed=parsed,
+                          generator_system, full_prompt, raw, parsed=parsed,
                           errors=errors, model=self.client.model, temp=0.7)
                 continue
 
             trace_call("generator", rule_id, attempt, "success",
-                      GENERATOR_SYSTEM, full_prompt, raw, parsed=parsed,
+                      generator_system, full_prompt, raw, parsed=parsed,
                       errors=[], model=self.client.model, temp=0.7,
                       start_time=t0)
             return AgentResult("generator", raw, parsed, [], latency)
@@ -305,13 +328,15 @@ class SolverAgent:
     call them to verify or compute answers deterministically.
     """
 
-    def __init__(self, client: LlmClient):
+    def __init__(self, client: LlmClient, prompt_provider: PromptProvider):
         self.client = client
+        self.prompt_provider = prompt_provider
         self.tool_stats: Dict[str, int] = {"calls": 0, "tool_rounds": 0}
 
     def solve(self, rule_content: str, question: str, rule_id: str = "",
               use_tools: bool = False) -> AgentResult:
         prompt = build_rule_prompt(rule_content, "") + f"\n\n## Puzzle\n{question}"
+        solver_system = self.prompt_provider.load().solver
         t0 = time.time()
 
         if use_tools and self.client.enabled:
@@ -326,15 +351,15 @@ class SolverAgent:
                     seen_names.add(rt["function"]["name"])
 
             tool_result = self.client.chat_with_tools(
-                SOLVER_SYSTEM, prompt,
+                solver_system, prompt,
                 tools=tools,
-                temperature=0.0, max_tokens=2048, max_rounds=6,
+                temperature=0.0, max_tokens=32768, max_rounds=6,
             )
             raw = tool_result.text
             self.tool_stats["calls"] += 1
             self.tool_stats["tool_rounds"] += tool_result.total_tool_calls
         else:
-            raw, _ = self.client.chat(SOLVER_SYSTEM, prompt, temperature=0.0, max_tokens=2048)
+            raw, _ = self.client.chat(solver_system, prompt, temperature=0.0, max_tokens=32768)
 
         latency_ms = int((time.time() - t0) * 1000)
 
@@ -347,7 +372,7 @@ class SolverAgent:
             ans = raw.strip()
 
         trace_call("solver", rule_id, 0, "solving",
-                   SOLVER_SYSTEM, prompt, raw,
+                   solver_system, prompt, raw,
                    parsed={"answer": ans},
                    model=self.client.model, temp=0.0,
                    start_time=t0)
@@ -365,8 +390,9 @@ class ReviewerAgent:
     and validators to get deterministic verdicts on answer correctness.
     """
 
-    def __init__(self, client: LlmClient):
+    def __init__(self, client: LlmClient, prompt_provider: PromptProvider):
         self.client = client
+        self.prompt_provider = prompt_provider
         self.tool_stats: Dict[str, int] = {"calls": 0, "tool_rounds": 0}
 
     def review(self, rule_content: str, question: str,
@@ -380,20 +406,21 @@ class ReviewerAgent:
             f"## Task\nCompare the two answers. Are they equivalent? "
             f"Does the Generator's answer satisfy all constraints? Output JSON."
         )
+        reviewer_system = self.prompt_provider.load().reviewer
         t0 = time.time()
 
         if use_tools and self.client.enabled:
             tools = get_tool_schemas_for_role("reviewer")
             tool_result = self.client.chat_with_tools(
-                REVIEWER_SYSTEM, prompt,
+                reviewer_system, prompt,
                 tools=tools,
-                temperature=0.0, max_tokens=1024, max_rounds=3,
+                temperature=0.0, max_tokens=32768, max_rounds=3,
             )
             raw = tool_result.text
             self.tool_stats["calls"] += 1
             self.tool_stats["tool_rounds"] += tool_result.total_tool_calls
         else:
-            raw, _ = self.client.chat(REVIEWER_SYSTEM, prompt, temperature=0.0, max_tokens=1024)
+            raw, _ = self.client.chat(reviewer_system, prompt, temperature=0.0, max_tokens=32768)
 
         latency_ms = int((time.time() - t0) * 1000)
 
@@ -405,7 +432,7 @@ class ReviewerAgent:
             parsed = {"verdict": "UNCLEAR", "score": 5, "issues": ["Could not parse reviewer output"]}
 
         trace_call("reviewer", rule_id, 0, "reviewing",
-                   REVIEWER_SYSTEM, prompt, raw,
+                   reviewer_system, prompt, raw,
                    parsed=parsed,
                    model=self.client.model, temp=0.0,
                    start_time=t0)
@@ -425,16 +452,20 @@ class MultiAgentPipeline:
 
     def __init__(self, cfg: Dict[str, Any]):
         self.client = LlmClient(cfg)
-        self.generator = GeneratorAgent(self.client, max_attempts=cfg.get("generator", {}).get("max_generation_attempts", 3))
-        self.solver = SolverAgent(self.client)
-        self.reviewer = ReviewerAgent(self.client)
+        self.prompt_provider = create_prompt_provider(cfg)
+        self.generator = GeneratorAgent(
+            self.client, self.prompt_provider,
+            max_attempts=cfg.get("generator", {}).get("max_generation_attempts", 3))
+        self.solver = SolverAgent(self.client, self.prompt_provider)
+        self.reviewer = ReviewerAgent(self.client, self.prompt_provider)
         self.cfg = cfg
         self.use_tools = cfg.get("generator", {}).get("use_tools", True)
 
     def run(self, rule_content: str, rule_title: str, rule_id: str,
             examples: List[Dict], target: Dict,
             require_reviewer_pass: bool = True,
-            use_tools: bool = None) -> GenerationOutput:
+            use_tools: bool = None,
+            memory_context: str = "") -> GenerationOutput:
         t0_total = time.time()
 
         # Determine whether to use tools (pipeline-level or per-call override)
@@ -444,6 +475,7 @@ class MultiAgentPipeline:
         gen_result = self.generator.generate(
             rule_content, rule_title, rule_id, examples, target,
             use_tools=_use_tools,
+            memory_context=memory_context,
         )
         if not gen_result.parsed:
             return GenerationOutput(

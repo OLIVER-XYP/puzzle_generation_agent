@@ -20,6 +20,8 @@ from .state import GraphState
 from .llm_gen import LlmRule
 from .agents import MultiAgentPipeline
 from .memory import create_memory
+from .prompt_provider import create_prompt_provider
+from .user_memory import UserMemoryManager
 
 
 def _load_eval(cfg) -> Dict[str, List[Dict[str, Any]]]:
@@ -86,6 +88,24 @@ class Context:
             db_url=mem_cfg.get("database_url", ""),
             db_path=mem_cfg.get("db_path", "data/memory.db"),
         )
+        self.pipeline.prompt_provider = create_prompt_provider(cfg, self.memory)
+        self.pipeline.generator.prompt_provider = self.pipeline.prompt_provider
+        self.pipeline.solver.prompt_provider = self.pipeline.prompt_provider
+        self.pipeline.reviewer.prompt_provider = self.pipeline.prompt_provider
+        self.user_memory = UserMemoryManager(
+            self.memory,
+            cfg.get("user_memory", {}),
+            rule_index={
+                rid: {
+                    "title": r.title,
+                    "tag": r.tag,
+                    "rule_content": r.rule_content,
+                    "examples": r.examples,
+                    "target": r.target,
+                }
+                for rid, r in self.rules.items()
+            },
+        )
 
 
 def build_context(cfg: Dict[str, Any]) -> Context:
@@ -136,6 +156,20 @@ def make_nodes(ctx: Context):
     cfg = ctx.cfg
     count = cfg["run"]["count_per_rule"]
     max_retries = cfg["run"]["max_retries_per_item"]
+
+    def load_user_memory(state: GraphState) -> GraphState:
+        """Load durable behavior memory before intent parsing/generation."""
+        mem_cfg = cfg.get("user_memory", {})
+        user_id = state.get("user_id") or mem_cfg.get("default_user_id", "default")
+        query = state.get("user_query", "")
+        if query:
+            ctx.user_memory.ingest_text(query, user_id=user_id)
+        state.update(
+            user_id=user_id,
+            user_memory_context=ctx.user_memory.context_text(user_id),
+            user_recommendations=ctx.user_memory.recommend_rules(user_id, limit=3),
+        )
+        return state
 
     # ---- Natural Language → Structured Intent ----
     def rewrite_query(state: GraphState) -> GraphState:
@@ -227,6 +261,10 @@ def make_nodes(ctx: Context):
             jobs = ([{"rule_id": rid, "count": req_count, "target": ctx.targets.get(rid, {})}
                      for rid in req_rules if rid in ctx.rules]
                     if req_count > 0 else [])
+            if jobs:
+                ctx.user_memory.record_requested_rules(
+                    state.get("user_id"), [j["rule_id"] for j in jobs])
+                state["user_memory_context"] = ctx.user_memory.context_text(state.get("user_id"))
             state.update(jobs=jobs, job_cursor=0,
                          eval_hashes=list(ctx.eval_hashes), accepted_hashes=[],
                          accepted_records=[], rejected_log=[],
@@ -307,6 +345,7 @@ def make_nodes(ctx: Context):
             rule.rule_content, rule.title, rid, rule.examples, rule.target,
             require_reviewer_pass=False,
             use_tools=ctx.use_tools,
+            memory_context=state.get("user_memory_context", ""),
         )
         if output.question and output.answer:
             state["candidate"] = {
@@ -403,6 +442,8 @@ def make_nodes(ctx: Context):
             state["item_retries"] = state.get("item_retries", 0) + 1
             state["rejected_log"].append(
                 {"rule": state["current_rule_id"], "reasons": reasons})
+            ctx.user_memory.record_rejection(
+                state.get("user_id"), state["current_rule_id"], reasons)
 
         # --- persistence: log every verification attempt ---
         ctx.memory.log_generation(
@@ -453,6 +494,7 @@ def make_nodes(ctx: Context):
 
         # --- persistence: save accepted puzzle ---
         ctx.memory.save_puzzle(record)
+        ctx.user_memory.record_acceptance(state.get("user_id"), rid, tag=rule.tag)
         return state
 
     def route_after_accept(state: GraphState) -> str:
@@ -460,6 +502,7 @@ def make_nodes(ctx: Context):
         return "dispatcher" if state["accepted_count"] >= job["count"] else "llm_synthesizer"
 
     return dict(
+        load_user_memory=load_user_memory,
         rewrite_query=rewrite_query,
         dispatcher=dispatcher, route_dispatch=route_dispatch,
         difficulty_sampler=difficulty_sampler,
@@ -472,6 +515,7 @@ def make_nodes(ctx: Context):
 def build_graph(ctx: Context):
     n = make_nodes(ctx)
     g = StateGraph(GraphState)
+    g.add_node("load_user_memory", n["load_user_memory"])
     g.add_node("rewrite_query", n["rewrite_query"])
     g.add_node("dispatcher", n["dispatcher"])
     g.add_node("llm_synthesizer", n["llm_synthesizer"])
@@ -482,7 +526,8 @@ def build_graph(ctx: Context):
     g.add_node("save_output", n["save_output"])
 
     # START → rewrite_query (NL→Intent) → dispatcher → ...
-    g.add_edge(START, "rewrite_query")
+    g.add_edge(START, "load_user_memory")
+    g.add_edge("load_user_memory", "rewrite_query")
     g.add_edge("rewrite_query", "dispatcher")
     g.add_conditional_edges("dispatcher", n["route_dispatch"],
                             {"llm_synthesizer": "llm_synthesizer", "summarize": "summarize"})

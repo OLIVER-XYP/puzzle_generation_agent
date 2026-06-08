@@ -18,10 +18,82 @@ import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from .rewriter import QueryRewriter, ParsedIntent, RewriteResult, create_rewriter
-from .agents import MultiAgentPipeline, create_pipeline, LlmClient
+from .agents import MultiAgentPipeline, LlmClient
 from .tracer import get_tracer
-from .tools import get_tools
-from .scheduler import create_executor, ParallelExecutor
+from .tools import get_tools, ToolExecutor
+from .scheduler import create_executor
+from .prompt_builder import ORCHESTRATOR_SYSTEM
+from .memory import create_memory
+from .prompt_provider import create_prompt_provider
+from .user_memory import UserMemoryManager
+
+
+# ======================================================================
+# Orchestration tools — the business actions the model can invoke.
+# These mirror the old _do_* dispatch table, but instead of Python picking
+# which one to run (rewriter → intent enum → if/elif), the MODEL chooses by
+# emitting tool calls into the top-level agentic loop.
+# ======================================================================
+
+ORCHESTRATION_TOOLS = [
+    {"type": "function", "function": {
+        "name": "list_rules",
+        "description": "列出全部 25 种谜题规则及其编号、标题、类别和样例数量。",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "inspect_rule",
+        "description": "查看某条规则的详情：标题、规则说明、难度范围和一个样例题目。",
+        "parameters": {"type": "object", "properties": {
+            "rule_id": {"type": "string", "description": "规则编号 1-25"},
+        }, "required": ["rule_id"]},
+    }},
+    {"type": "function", "function": {
+        "name": "generate_puzzles",
+        "description": "为指定规则生成 N 道新题目。用户给的是题型名(如'摩天大楼')时，"
+                       "你需先映射到对应的 rule_id 再调用。",
+        "parameters": {"type": "object", "properties": {
+            "rule_id": {"type": "string", "description": "规则编号 1-25"},
+            "count": {"type": "integer", "description": "生成数量，默认 1", "default": 1},
+            "bucket": {"type": "string", "enum": ["short", "medium", "long"],
+                       "description": "难度：short/medium/long，默认 medium"},
+        }, "required": ["rule_id"]},
+    }},
+    {"type": "function", "function": {
+        "name": "validate_quality",
+        "description": "校验本次会话已生成题目的质量，返回通过率和发现的问题。",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "export_dataset",
+        "description": "把本次会话生成的合格题目导出为 jsonl 数据集文件。",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "输出文件路径，默认 data/out/fine_dataset.jsonl"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "get_stats",
+        "description": "返回本次会话的统计：批次数、生成总数、各 agent 的 API 调用 trace。",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "record_feedback",
+        "description": "记录用户对题型、难度、规则或生成结果的偏好反馈，用于跨会话个性化。",
+        "parameters": {"type": "object", "properties": {
+            "feedback": {"type": "string", "description": "用户原始反馈"},
+            "rule_id": {"type": "string", "description": "可选规则编号 1-25"},
+            "sentiment": {"type": "string", "enum": ["positive", "neutral", "negative"],
+                          "description": "反馈倾向，默认 neutral"},
+        }, "required": ["feedback"]},
+    }},
+    {"type": "function", "function": {
+        "name": "recommend_next_rules",
+        "description": "根据跨会话用户记忆推荐下一批适合生成的规则。",
+        "parameters": {"type": "object", "properties": {
+            "limit": {"type": "integer", "description": "推荐数量，默认 3"},
+        }},
+    }},
+]
 
 
 class PuzzleAgent:
@@ -29,7 +101,7 @@ class PuzzleAgent:
 
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
-        self.pipeline = create_pipeline()
+        self.pipeline = MultiAgentPipeline(cfg)
         self.client = LlmClient(cfg)
         self.tracer = get_tracer()
 
@@ -53,6 +125,22 @@ class PuzzleAgent:
                 "target": self._calc_target(examples),
             }
 
+        mem_cfg = cfg.get("memory", {})
+        self.memory = create_memory(
+            use_redis=(mem_cfg.get("stm", "dict") == "redis"),
+            use_postgres=(mem_cfg.get("ltm", "sqlite") == "postgres"),
+            redis_url=mem_cfg.get("redis_url", ""),
+            db_url=mem_cfg.get("database_url", ""),
+            db_path=mem_cfg.get("db_path", "data/memory.db"),
+        )
+        self.pipeline.prompt_provider = create_prompt_provider(cfg, self.memory)
+        self.pipeline.generator.prompt_provider = self.pipeline.prompt_provider
+        self.pipeline.solver.prompt_provider = self.pipeline.prompt_provider
+        self.pipeline.reviewer.prompt_provider = self.pipeline.prompt_provider
+        self.user_memory = UserMemoryManager(
+            self.memory, cfg.get("user_memory", {}), self.rule_index)
+        self.user_id = cfg.get("user_memory", {}).get("default_user_id", "default")
+
         # Query rewriter (with LLM for complex queries)
         self.rewriter = create_rewriter(self.rule_index, cfg)
 
@@ -64,7 +152,78 @@ class PuzzleAgent:
         self.tools = get_tools()
         self.executor = create_executor(max_workers=5, max_rpm=30)
 
-        self.messages: List[Dict] = []          # conversation history
+        # ---- Top-level agentic loop (Claude-Code-style orchestration) ----
+        # A dedicated ToolExecutor whose registry holds the business actions.
+        # The model drives this loop and owns the control flow.
+        self.orch_executor = ToolExecutor()
+        self._register_orchestration_tools()
+        self.messages: List[Dict] = [
+            {"role": "system", "content": ORCHESTRATOR_SYSTEM},
+        ]
+        self._refresh_system_memory()
+
+    # ------------------------------------------------------------------ #
+    # Orchestration tools (bound wrappers over the _do_* business methods)
+    # ------------------------------------------------------------------ #
+
+    def _register_orchestration_tools(self):
+        reg = self.orch_executor.registry
+        reg.register("list_rules", lambda: self._do_list_rules(),
+                     "List all rules")
+        reg.register("inspect_rule", lambda rule_id="": self._do_inspect(str(rule_id)),
+                     "Inspect one rule")
+        reg.register("generate_puzzles", self._tool_generate,
+                     "Generate N puzzles for a rule")
+        reg.register("validate_quality", lambda: self._do_validate(),
+                     "Validate session quality")
+        reg.register("export_dataset",
+                     lambda path="data/out/fine_dataset.jsonl": self._do_export(path),
+                     "Export generated puzzles")
+        reg.register("get_stats", lambda: self._do_stats(), "Session stats")
+        reg.register("record_feedback", self._tool_record_feedback,
+                     "Record durable user preference feedback")
+        reg.register("recommend_next_rules", self._tool_recommend_next_rules,
+                     "Recommend next rules from user memory")
+
+    def _tool_generate(self, rule_id="", count=1, bucket="medium") -> Dict[str, Any]:
+        """Tool wrapper: generate, then return a token-compact result the model
+        can reason over (keeps only a couple of sample Q/A pairs)."""
+        res = self._do_generate(str(rule_id), int(count or 1), bucket or "medium")
+        if res.get("error"):
+            return res
+        samples = [{"question": r["question"], "answer": r["answer"]}
+                   for r in res.get("results", [])[:2]]
+        return {
+            "rule_id": res["rule_id"], "title": res["title"], "mode": res["mode"],
+            "count": res["count"], "passed": res["passed"], "samples": samples,
+        }
+
+    def _tool_record_feedback(self, feedback="", rule_id="", sentiment="neutral") -> Dict[str, Any]:
+        profile = self.user_memory.record_feedback(
+            str(feedback), user_id=self.user_id,
+            rule_id=str(rule_id or ""), sentiment=str(sentiment or "neutral"))
+        self._refresh_system_memory()
+        return {
+            "action": "record_feedback",
+            "difficulty_preference": profile.difficulty_preference,
+            "preferred_rules": profile.preferred_rules,
+            "preferred_tags": profile.preferred_tags,
+        }
+
+    def _tool_recommend_next_rules(self, limit=3) -> Dict[str, Any]:
+        recs = self.user_memory.recommend_rules(self.user_id, limit=int(limit or 3))
+        return {"action": "recommend_next_rules", "recommendations": recs}
+
+    def _refresh_system_memory(self) -> None:
+        memory_text = self.user_memory.context_text(self.user_id)
+        system = (
+            ORCHESTRATOR_SYSTEM
+            + "\n\n## Durable User Memory\n"
+            + memory_text
+            + "\nUse this as a soft preference signal. Call record_feedback when the user states preferences."
+        )
+        if self.messages:
+            self.messages[0] = {"role": "system", "content": system}
 
     def _calc_target(self, examples):
         return {
@@ -78,7 +237,57 @@ class PuzzleAgent:
     # ------------------------------------------------------------------ #
 
     def chat(self, user_message: str) -> str:
+        """Process one user message via the top-level agentic loop.
+
+        The model owns the control flow: it reads the running conversation,
+        decides which orchestration tools to call (and may chain several),
+        then writes the final reply itself. Falls back to the legacy
+        rewriter→dispatch pipeline when no LLM is available (offline).
+        """
+        if not self.client.enabled:
+            return self._chat_legacy(user_message)
+
+        self.user_memory.ingest_text(user_message, user_id=self.user_id)
+        self._refresh_system_memory()
+        self.messages.append({"role": "user", "content": user_message})
+        self._trim_history()
+
+        result = self.orch_executor.run_loop(
+            client=self.client,
+            messages=self.messages,
+            tools=ORCHESTRATION_TOOLS,
+            temperature=0.3,
+            max_tokens=16384,  # reasoning model: leave room for long CoT + reply
+            max_rounds=10,
+        )
+
+        # Record orchestration tool calls for the tracer/debugging.
+        if hasattr(self.tracer, "log_tool_call"):
+            for call in result.tool_calls_made:
+                self.tracer.log_tool_call(call)
+
+        return result.text or "（我没能给出回复，请换个说法再试一次。）"
+
+    def _trim_history(self, max_len: int = 40, keep_tail: int = 24) -> None:
+        """Cap conversation growth. Keeps the system prompt + a recent tail,
+        and never starts the tail mid tool-sequence (a 'tool' message must
+        follow its triggering 'assistant' tool_calls, or the API rejects it)."""
+        if len(self.messages) <= max_len:
+            return
+        system = self.messages[0]
+        tail = self.messages[-keep_tail:]
+        # Advance to the next clean 'user' boundary so we don't orphan a
+        # tool result or a tool_calls assistant message.
+        for i, m in enumerate(tail):
+            if m.get("role") == "user":
+                tail = tail[i:]
+                break
+        self.messages = [system] + tail
+
+    def _chat_legacy(self, user_message: str) -> str:
         """Process one user message. Returns Agent response."""
+        self.user_memory.ingest_text(user_message, user_id=self.user_id)
+        self._refresh_system_memory()
         # Step 1: Rewrite query → structured intents
         session_summary = self._session_summary()
         rewritten = self.rewriter.rewrite(user_message, session_summary)
@@ -135,6 +344,8 @@ class PuzzleAgent:
             return self._do_export(params.get("path", "data/out/fine_dataset.jsonl"))
         elif action == "STATS":
             return self._do_stats()
+        elif action == "RECOMMEND":
+            return self._do_recommend(params.get("limit", 3))
         elif action == "HELP":
             return self._do_help()
         return {"error": f"Unknown action: {action}"}
@@ -170,6 +381,7 @@ class PuzzleAgent:
             return {"error": f"Rule {rid} 不存在"}
 
         r = self.rule_index[rid]
+        self.user_memory.record_requested_rules(self.user_id, [rid])
 
         # Start a batch (detects first vs supplement mode)
         batch = self.session.start_batch(rid, r["title"], count)
@@ -182,6 +394,7 @@ class PuzzleAgent:
                 r["rule_content"], r["title"], rid, r["examples"], r["target"],
                 require_reviewer_pass=False,
                 use_tools=self.pipeline.use_tools,  # respect pipeline-level setting
+                memory_context=self.user_memory.context_text(self.user_id),
             )
             rec = {
                 "index": i + 1,
@@ -192,6 +405,10 @@ class PuzzleAgent:
                 "latency_s": round(output.latency_total_ms / 1000, 1),
             }
             self.session.add_result(batch.batch_id, rec)
+            if output.generator_ok:
+                self.user_memory.record_acceptance(self.user_id, rid, tag=r.get("tag", ""))
+            else:
+                self.user_memory.record_rejection(self.user_id, rid, ["generation_failed"])
             results.append(rec)
 
         passed = sum(1 for r in results if r["generator_ok"])
@@ -209,6 +426,8 @@ class PuzzleAgent:
             count = intent.params.get("count", 1)
             r = self.rule_index.get(rid, {})
             jobs.append({"rule_id": rid, "title": r.get("title", f"Rule {rid}"), "count": count})
+        self.user_memory.record_requested_rules(self.user_id, [j["rule_id"] for j in jobs])
+        memory_context = self.user_memory.context_text(self.user_id)
 
         def _gen_fn(rid, count):
             r = self.rule_index.get(rid)
@@ -220,12 +439,17 @@ class PuzzleAgent:
                 output = self.pipeline.run(
                     r["rule_content"], r["title"], rid, r["examples"], r["target"],
                     require_reviewer_pass=False,
-                    use_tools=self.pipeline.use_tools)
+                    use_tools=self.pipeline.use_tools,
+                    memory_context=memory_context)
                 rec = {"index": i+1, "question": output.question[:200] if output.question else "",
                        "answer": output.answer[:150] if output.answer else "",
                        "generator_ok": output.generator_ok,
                        "latency_s": round(output.latency_total_ms/1000, 1)}
                 self.session.add_result(batch.batch_id, rec)
+                if output.generator_ok:
+                    self.user_memory.record_acceptance(self.user_id, rid, tag=r.get("tag", ""))
+                else:
+                    self.user_memory.record_rejection(self.user_id, rid, ["generation_failed"])
                 results.append(rec)
             return results
 
@@ -241,13 +465,16 @@ class PuzzleAgent:
             return {"error": "还没有生成过题目"}
 
         total = self.session.total_generated()
+        passed = 0
         issues = []
         for b in self.session.batches:
             for rec in b.records:
                 if not rec.get("generator_ok"):
                     issues.append(f"Rule {b.rule_id} #{rec['index']}: 生成失败")
-                if rec.get("reviewer_score", 0) < 5:
+                elif rec.get("reviewer_score", 0) < 5:
                     issues.append(f"Rule {b.rule_id} #{rec['index']}: Reviewer评分低({rec['reviewer_score']})")
+                else:
+                    passed += 1
 
         return {
             "action": "validate",
@@ -289,6 +516,16 @@ class PuzzleAgent:
             "generated": self.session.total_generated(),
             "trace": trace,
             "trace_per_agent": trace.get("by_role", {}),
+            "user_memory": self.user_memory.get_profile(self.user_id).to_dict(),
+            "recommendations": self.user_memory.recommend_rules(self.user_id, limit=3),
+        }
+
+    def _do_recommend(self, limit: int = 3) -> Dict:
+        return {
+            "action": "recommend",
+            "recommendations": self.user_memory.recommend_rules(
+                self.user_id, limit=int(limit or 3)),
+            "user_memory": self.user_memory.get_profile(self.user_id).to_dict(),
         }
 
     def _do_help(self) -> Dict:
@@ -310,6 +547,7 @@ class PuzzleAgent:
             "VALIDATE": "Report validation results in Chinese. State pass rate and any issues found.",
             "EXPORT": "Confirm export in Chinese. State file path and record count.",
             "STATS": "Report stats in Chinese. Include total generated, per-agent trace.",
+            "RECOMMEND": "Recommend next puzzle rules in Chinese. Mention why each rule fits the user's memory. Keep under 300 chars.",
             "HELP": "Output the help text verbatim.",
         }
 
@@ -338,6 +576,12 @@ class PuzzleAgent:
             t = result.get("trace", {})
             return (f"生成 {result['generated']} 题 | "
                     f"API调用 {t.get('total_calls',0)} | 成功率 {t.get('pass_rate','?')}")
+        elif a == "RECOMMEND":
+            recs = result.get("recommendations", [])
+            if not recs:
+                return "暂时没有足够偏好记录，建议先试 Rule 10、25 或 15。"
+            parts = [f"R{r['rule_id']} {r['title']}（{r['reason']}）" for r in recs]
+            return "推荐下一步：" + "；".join(parts)
         elif a == "HELP":
             return result.get("text", _HELP_TEXT)
         return json.dumps(result, ensure_ascii=False, indent=2)[:500]

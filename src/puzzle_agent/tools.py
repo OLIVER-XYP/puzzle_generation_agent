@@ -1524,12 +1524,46 @@ class ToolExecutor:
         if tools is None:
             tools = TOOL_SCHEMAS
 
-        self.call_log = []
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
+        return self.run_loop(
+            client, messages, tools=tools, temperature=temperature,
+            max_tokens=max_tokens, max_rounds=max_rounds, model=model,
+        )
 
+    def run_loop(
+        self,
+        client: Any,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        max_rounds: int = 8,
+        model: str = None,
+    ) -> "ToolResult":
+        """Run the tool-calling loop over an existing conversation.
+
+        Unlike chat_with_tools (which starts from system+user), this drives the
+        loop over a full `messages` list and APPENDS the assistant/tool messages
+        it produces back into that same list — so the caller keeps the running
+        conversation history. This is the top-level agentic loop: the model owns
+        control flow, deciding which tools to call and when to answer.
+
+        Args:
+            client: LlmClient (needs .chat_raw(messages, tools, ...))
+            messages: Full conversation so far (system + prior turns). Mutated.
+            tools: OpenAI tool schemas the model may call.
+            max_rounds: Max LLM→tool→LLM rounds before forcing a text answer.
+
+        Returns:
+            ToolResult with the final assistant text + tool call log + stats.
+        """
+        if tools is None:
+            tools = TOOL_SCHEMAS
+
+        self.call_log = []
         final_text = ""
         total_rounds = 0
         total_tool_calls = 0
@@ -1537,7 +1571,7 @@ class ToolExecutor:
         for round_idx in range(max_rounds):
             total_rounds = round_idx + 1
 
-            # Call LLM with tools
+            # On the last allowed round, drop tools to force a text answer.
             raw_resp = client.chat_raw(
                 messages=messages,
                 tools=tools if round_idx < max_rounds - 1 else None,
@@ -1547,21 +1581,13 @@ class ToolExecutor:
             )
 
             if raw_resp is None:
-                final_text = ""
                 break
 
-            choice = raw_resp.choices[0]
-            msg = choice.message
+            msg = raw_resp.choices[0].message
 
-            # If text response (no tool calls), we're done
-            if msg.content and not msg.tool_calls:
-                final_text = msg.content
-                break
-
-            # If tool calls, execute them
+            # Tool calls take priority (a message may carry both content + calls).
             if msg.tool_calls:
-                # Record the assistant message with tool_calls
-                assistant_msg = {
+                messages.append({
                     "role": "assistant",
                     "content": msg.content or "",
                     "tool_calls": [
@@ -1575,19 +1601,15 @@ class ToolExecutor:
                         }
                         for tc in msg.tool_calls
                     ],
-                }
-                messages.append(assistant_msg)
-
-                # Execute each tool call
+                })
                 for tc in msg.tool_calls:
-                    tool_msg = self.execute_tool_call(tc)
-                    messages.append(tool_msg)
+                    messages.append(self.execute_tool_call(tc))
                     total_tool_calls += 1
-
                 continue
 
-            # Empty response — stop
+            # Plain text response → final answer. Persist it to history.
             final_text = msg.content or ""
+            messages.append({"role": "assistant", "content": final_text})
             break
 
         return ToolResult(

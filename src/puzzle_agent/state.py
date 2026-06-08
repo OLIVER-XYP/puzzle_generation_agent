@@ -10,6 +10,9 @@ class GraphState(TypedDict, total=False):
     count: int                           # e.g. 10 — override config
 
     config: Dict[str, Any]
+    user_id: str
+    user_memory_context: str
+    user_recommendations: List[Dict[str, Any]]
 
     # job queue produced by the dispatcher
     jobs: List[Dict[str, Any]]          # [{rule_id, count, target}]
